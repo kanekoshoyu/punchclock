@@ -1,4 +1,5 @@
 mod agent;
+mod tui;
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;

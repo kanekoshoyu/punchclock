@@ -1,10 +1,12 @@
 use anyhow::{bail, Context};
 use dialoguer::{theme::ColorfulTheme, Input};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::{Path, PathBuf}, process::Stdio, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{collections::HashMap, path::{Path, PathBuf}, process::Stdio, sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::SyncSender}};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{interval, Duration};
+
+use crate::tui::{spawn_tui, TuiEvent};
 
 // ── PID file ──────────────────────────────────────────────────────────────────
 
@@ -379,12 +381,12 @@ pub async fn run() -> anyhow::Result<()> {
             .and_then(|r| r.error_for_status())
         {
             Ok(r) => match r.json::<RegisterResponse>().await {
-                Ok(res) => { eprintln!("registered  agent_id: {}", res.agent_id); res.agent_id }
+                Ok(res) => { res.agent_id }
                 Err(_) => uuid::Uuid::new_v4().to_string(),
             },
             Err(_) => {
                 let id = uuid::Uuid::new_v4().to_string();
-                eprintln!("server offline — local agent_id: {id}  (will register when connected)");
+                // will show as OFFLINE in TUI; agent_id logged in AgentInfo
                 id
             }
         };
@@ -396,9 +398,12 @@ pub async fn run() -> anyhow::Result<()> {
     let claude_flags = config.claude_flags.clone();
     let root_str = root.to_string_lossy().to_string();
 
-    eprintln!("agent    : {} ({})", config.name, agent_id);
-    eprintln!("server   : {base}");
-    eprintln!("routing messages + tasks → claude CLI\n");
+    let tx = spawn_tui();
+    let _ = tx.send(TuiEvent::AgentInfo {
+        name: config.name.clone(),
+        id: agent_id.clone(),
+        server: base.clone(),
+    });
 
     // show pending tasks on startup
     {
@@ -415,19 +420,19 @@ pub async fn run() -> anyhow::Result<()> {
         entries.sort_by_key(|(_, t)| *t);
         let total = entries.len();
         if total == 0 {
-            eprintln!("no tasks in .task/todo/");
+            let _ = tx.send(TuiEvent::Log("no tasks in .task/todo/".to_string()));
         } else {
-            eprintln!("{total} task(s) queued:");
+            let mut summary = format!("{total} task(s) queued:");
             for (path, _) in entries.iter().take(5) {
                 let content = std::fs::read_to_string(path).unwrap_or_default();
                 let title = content.lines()
                     .find(|l| l.starts_with("# "))
-                    .map(|l| l.trim_start_matches("# "))
-                    .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"));
-                eprintln!("  • {title}");
+                    .map(|l| l.trim_start_matches("# ").to_string())
+                    .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string());
+                summary.push_str(&format!("  • {title}"));
             }
-            if total > 5 { eprintln!("  … and {} more", total - 5); }
-            eprintln!();
+            if total > 5 { summary.push_str(&format!("  … and {} more", total - 5)); }
+            let _ = tx.send(TuiEvent::Log(summary));
         }
     }
 
@@ -447,6 +452,7 @@ pub async fn run() -> anyhow::Result<()> {
     let hb_desc = config.description.clone();
     let hb_root = root_str.clone();
     let hb_connected = connected.clone();
+    let hb_tx = tx.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut ticker = interval(Duration::from_secs(5));
@@ -465,8 +471,9 @@ pub async fn run() -> anyhow::Result<()> {
                 .and_then(|r| r.error_for_status())
                 .is_ok();
             let was = hb_connected.swap(ok, Ordering::Relaxed);
-            if ok && !was  { eprintln!("↑ connected to {hb_base}"); }
-            if !ok && was  { eprintln!("↓ server unreachable, working offline"); }
+            if ok != was {
+                let _ = hb_tx.send(TuiEvent::ServerStatus(ok));
+            }
         }
     });
 
@@ -474,6 +481,7 @@ pub async fn run() -> anyhow::Result<()> {
     let task_base = base.clone();
     let task_flags = claude_flags.clone();
     let task_root = root_str.clone();
+    let task_tx = tx.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut ticker = interval(Duration::from_secs(5));
@@ -501,25 +509,14 @@ pub async fn run() -> anyhow::Result<()> {
                 entries.sort_by_key(|(_, t)| *t);
                 if entries.is_empty() { continue; }
 
-                if entries.len() == 1 {
-                    let id = entries[0].0.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                    priority_queue = vec![id];
-                } else {
-                    // triage: ask Claude to order and categorize all pending tasks
-                    let summaries: Vec<(String, String, String)> = entries.iter().map(|(p, _)| {
-                        let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
-                        let content = std::fs::read_to_string(p).unwrap_or_default();
-                        let title = content.lines()
-                            .find(|l| l.starts_with("# "))
-                            .map(|l| l.trim_start_matches("# ").to_string())
-                            .unwrap_or_else(|| id.clone());
-                        let preview: String = content.chars().take(300).collect();
-                        (id, title, preview)
-                    }).collect();
-                    eprintln!("📋 triaging {} pending tasks…", summaries.len());
-                    priority_queue = triage_tasks(&summaries, &done_dir, &blocked_dir, &task_flags, &task_root).await;
-                    if priority_queue.is_empty() { continue; }
-                }
+                // order by mtime (oldest first — FIFO)
+                let count = entries.len();
+                let _ = task_tx.send(TuiEvent::Triaging { count });
+                priority_queue = entries.iter()
+                    .map(|(p, _)| p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string())
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                if priority_queue.is_empty() { continue; }
             }
 
             // pop the next valid task from the queue
@@ -541,17 +538,15 @@ pub async fn run() -> anyhow::Result<()> {
                 .find(|l| l.starts_with("# "))
                 .map(|l| l.trim_start_matches("# ").to_string())
                 .unwrap_or_else(|| tid.clone());
-            eprintln!("⚙ task [{tid}] {title}");
+            let _ = task_tx.send(TuiEvent::TaskStart { id: tid.clone(), title: title.clone() });
 
-            // run claude with the full task file as the prompt
-            eprintln!("  claude working on [{tid}]…");
             let prompt = format!(
                 "IMPORTANT: If you cannot complete this task for any reason — missing permissions, \
                  need clarification, blocked by something outside your control — respond with \
                  BLOCKED: <reason> as the very first line of your response. Do not ask questions; \
                  just state what is needed.\n\n{content}"
             );
-            let reply = route_to_claude(&prompt, &task_flags, &task_root).await;
+            let reply = route_to_claude(&prompt, &task_flags, &task_root, &task_tx, &format!("working on [{tid}]…")).await;
 
             // detect BLOCKED: <reason> as the first line of output
             let (status, dest_dir, section_heading) =
@@ -562,7 +557,11 @@ pub async fn run() -> anyhow::Result<()> {
                 } else {
                     ("done", &done_dir, "Result")
                 };
-            eprintln!("✓ task [{tid}] {status} ({} chars)", reply.len());
+            let _ = task_tx.send(TuiEvent::TaskDone {
+                id: tid.clone(),
+                status: status.to_string(),
+                chars: reply.len(),
+            });
 
             // git mv todo → dest (.task/done/ or .task/blocked/)
             let dest_file = dest_dir.join(format!("{tid}.md"));
@@ -624,7 +623,7 @@ pub async fn run() -> anyhow::Result<()> {
         tokio::select! {
             _ = poll.tick() => {}
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nshutting down…");
+                let _ = tx.send(TuiEvent::Shutdown);
                 break;
             }
         }
@@ -646,9 +645,9 @@ pub async fn run() -> anyhow::Result<()> {
         };
 
         for msg in inbox.messages {
-            eprintln!("← [{}] {}", msg.from, msg.body);
-            let reply = route_to_claude(&msg.body, &claude_flags, &root_str).await;
-            eprintln!("→ reply ({} chars)", reply.len());
+            let _ = tx.send(TuiEvent::MsgRecv { from: msg.from.clone() });
+            let reply = route_to_claude(&msg.body, &claude_flags, &root_str, &tx, &format!("replying to {}…", msg.from)).await;
+            let _ = tx.send(TuiEvent::MsgSent { chars: reply.len() });
             let _ = client
                 .get(format!("{base}/message/send"))
                 .query(&[("to", &msg.from), ("from", &agent_id), ("body", &reply)])
@@ -659,89 +658,17 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ask Claude to triage a list of pending tasks.
-/// Moves SKIP tasks to done/ and BLOCK tasks to blocked/ via `git mv`.
-/// Returns an ordered list of task IDs to work on (WORK decisions, highest priority first).
-async fn triage_tasks(
-    tasks: &[(String, String, String)], // (id, title, preview)
-    done_dir: &std::path::Path,
-    blocked_dir: &std::path::Path,
-    flags: &str,
-    cwd: &str,
-) -> Vec<String> {
-    let mut prompt = String::from(
-        "You are triaging a software task queue. Review each pending task and assign it one of three fates.\n\n\
-         Tasks:\n"
-    );
-    for (id, title, preview) in tasks {
-        prompt.push_str(&format!("\n[{id}] {title}\n{preview}\n"));
-    }
-    prompt.push_str(
-        "\nRespond with EXACTLY one line per task (include every task ID):\n\
-         WORK: <id>           — keep, will be worked on (list in priority order, highest first)\n\
-         SKIP: <id> | <reason>  — obsolete, already done, or superseded\n\
-         BLOCK: <id> | <question>  — needs human input before it can proceed\n\
-         \nDo not include any other text."
-    );
 
-    let reply = route_to_claude(&prompt, flags, cwd).await;
-    let todo_dir = std::path::Path::new(cwd).join(".task/todo");
-    let mut work_ids: Vec<String> = Vec::new();
-
-    for line in reply.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("WORK:") {
-            let id = rest.trim().to_string();
-            if !id.is_empty() { work_ids.push(id); }
-        } else if let Some(rest) = line.strip_prefix("SKIP:") {
-            let id = rest.split('|').next().unwrap_or("").trim().to_string();
-            let reason = rest.split_once('|').map(|(_, r)| r.trim()).unwrap_or("obsolete or superseded");
-            if id.is_empty() { continue; }
-            let src = todo_dir.join(format!("{id}.md"));
-            let dest = done_dir.join(format!("{id}.md"));
-            if src.exists() {
-                let _ = std::process::Command::new("git")
-                    .args(["mv", &src.to_string_lossy(), &dest.to_string_lossy()])
-                    .current_dir(cwd)
-                    .output();
-                if let Ok(mut c) = std::fs::read_to_string(&dest) {
-                    c.push_str(&format!("\n## Result\n\nSkipped: {reason}\n"));
-                    let _ = std::fs::write(&dest, c);
-                }
-                eprintln!("⊘ skipped [{id}]: {reason}");
-            }
-        } else if let Some(rest) = line.strip_prefix("BLOCK:") {
-            let id = rest.split('|').next().unwrap_or("").trim().to_string();
-            let question = rest.split_once('|').map(|(_, r)| r.trim()).unwrap_or("needs human input");
-            if id.is_empty() { continue; }
-            let src = todo_dir.join(format!("{id}.md"));
-            let dest = blocked_dir.join(format!("{id}.md"));
-            if src.exists() {
-                let _ = std::process::Command::new("git")
-                    .args(["mv", &src.to_string_lossy(), &dest.to_string_lossy()])
-                    .current_dir(cwd)
-                    .output();
-                if let Ok(mut c) = std::fs::read_to_string(&dest) {
-                    c.push_str(&format!("\n## Blocked\n\n{question}\n"));
-                    let _ = std::fs::write(&dest, c);
-                }
-                eprintln!("⚡ blocked [{id}]: {question}");
-            }
-        }
-    }
-
-    work_ids
-}
-
-async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
+async fn route_to_claude(body: &str, flags: &str, cwd: &str, tx: &SyncSender<TuiEvent>, label: &str) -> String {
     let mut cmd = Command::new("claude");
     cmd.arg("-p").arg(body);
-    cmd.arg("--dangerouslySkipPermissions");
+    cmd.arg("--dangerously-skip-permissions");
     cmd.arg("--output-format").arg("stream-json");
+    cmd.arg("--verbose");
     cmd.current_dir(cwd);
     cmd.env_remove("CLAUDECODE");
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
+    cmd.stderr(Stdio::piped());
     for flag in flags.split_whitespace().filter(|s| !s.is_empty()) {
         cmd.arg(flag);
     }
@@ -755,21 +682,32 @@ async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
         Some(s) => s,
         None => return "[failed to capture stdout]".to_string(),
     };
+    let stderr = child.stderr.take();
 
-    // spinner state
-    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut frame = 0usize;
     let mut files_written: Vec<String> = Vec::new();
     let mut files_read: Vec<String> = Vec::new();
     let mut bash_runs: u32 = 0;
     let mut result_text = String::new();
+    let mut is_error = false;
+
+    let _ = tx.send(TuiEvent::SpinnerUpdate(label.to_string()));
+
+    // drain stderr in background so it doesn't block stdout
+    let stderr_task = tokio::spawn(async move {
+        if let Some(s) = stderr {
+            let mut lines = BufReader::new(s).lines();
+            let mut buf = Vec::new();
+            while let Ok(Some(l)) = lines.next_line().await {
+                buf.push(l);
+            }
+            buf
+        } else {
+            Vec::new()
+        }
+    });
 
     let mut lines = BufReader::new(stdout).lines();
     loop {
-        // advance spinner on each line
-        eprint!("\r{} Orchestrating…", FRAMES[frame % FRAMES.len()]);
-        frame += 1;
-
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
             Ok(None) => break,
@@ -795,7 +733,7 @@ async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
                                         .and_then(|p| p.as_str())
                                     {
                                         files_written.push(path.to_string());
-                                        eprint!("\r{} Editing {}…        ", FRAMES[frame % FRAMES.len()], path);
+                                        let _ = tx.send(TuiEvent::SpinnerUpdate(format!("Editing {path}…")));
                                     }
                                 }
                                 "Read" => {
@@ -812,8 +750,8 @@ async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
                                         .and_then(|i| i.get("command"))
                                         .and_then(|c| c.as_str())
                                         .unwrap_or("…");
-                                    let preview: String = cmd_str.chars().take(40).collect();
-                                    eprint!("\r{} Running {}…        ", FRAMES[frame % FRAMES.len()], preview);
+                                    let preview: String = cmd_str.chars().take(50).collect();
+                                    let _ = tx.send(TuiEvent::SpinnerUpdate(format!("Running {preview}…")));
                                 }
                                 _ => {}
                             }
@@ -822,32 +760,36 @@ async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
                 }
             }
             Some("result") => {
+                is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
                 result_text = v
                     .get("result")
                     .and_then(|r| r.as_str())
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if v.get("subtype").and_then(|s| s.as_str()) == Some("error_during_execution") {
-                    let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
-                    // clear spinner line
-                    eprint!("\r{:width$}\r", "", width = 60);
-                    return format!("[claude exited with error] {err}");
-                }
             }
             _ => {}
         }
     }
 
-    // clear spinner line
-    eprint!("\r{:width$}\r", "", width = 60);
+    // collect stderr and exit code
+    let stderr_lines = stderr_task.await.unwrap_or_default();
+    let exit_status = child.wait().await.ok();
+    let exit_ok = exit_status.map(|s| s.success()).unwrap_or(false);
 
-    // wait for process
-    let status = child.wait().await;
-    if let Ok(s) = status {
-        if !s.success() && result_text.is_empty() {
-            return format!("[claude exited {}]", s);
-        }
+    // log stderr if present
+    if !stderr_lines.is_empty() {
+        let preview: String = stderr_lines.join(" ").chars().take(200).collect();
+        let _ = tx.send(TuiEvent::Log(format!("  ✗ stderr: {preview}")));
+    }
+
+    // surface non-zero exit as an error result
+    if !exit_ok && result_text.is_empty() {
+        let code = exit_status.and_then(|s| s.code()).map(|c| c.to_string()).unwrap_or_else(|| "?".to_string());
+        result_text = format!("[claude exited {code}]{}", if stderr_lines.is_empty() { String::new() } else { format!(": {}", stderr_lines.join("; ")) });
+        is_error = true;
+    } else if is_error && result_text.is_empty() {
+        result_text = "[claude reported an error with no message]".to_string();
     }
 
     // emit coarse summary
@@ -864,7 +806,12 @@ async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
         parts.push(format!("ran {} command(s)", bash_runs));
     }
     if !parts.is_empty() {
-        eprintln!("  ↳ {}", parts.join(", "));
+        let _ = tx.send(TuiEvent::Log(format!("  ↳ {}", parts.join(", "))));
+    }
+
+    // if claude flagged is_error but still produced text, prefix so callers route it to blocked
+    if is_error && !result_text.starts_with("[claude exited") {
+        result_text = format!("[claude exited with error]: {result_text}");
     }
 
     result_text
