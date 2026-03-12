@@ -93,3 +93,7 @@ No prompt injection, no task awareness — the message body is passed as-is to
 - Multi-message conversation threading
 - Template inheritance (`extends:`)
 - Choice/bool question types (string + multiline only for now)
+
+## Result
+
+Skipped: fully implemented in v0.3.0 per CLAUDE.md daemon description

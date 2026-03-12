@@ -1,0 +1,7 @@
+services:
+  punchclock-server:
+    build: .
+    environment:
+      RUST_LOG: info
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8421}
+    restart: unless-stopped

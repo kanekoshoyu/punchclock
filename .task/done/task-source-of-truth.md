@@ -25,3 +25,7 @@ one task at a time without double-processing.
   written directly to `.task/todo/` by whoever queues the work.
 - The daemon reads its queue from `.task/todo/` on disk rather than polling
   the server.
+
+## Result
+
+Skipped: commit 119be5c "task directory as source of truth" already landed
