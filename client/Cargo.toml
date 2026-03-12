@@ -22,3 +22,4 @@ dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 ratatui = "0.29"
 crossterm = "0.28"
+punchclock-common = { path = "../common" }

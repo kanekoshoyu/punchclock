@@ -5,6 +5,7 @@ use std::{collections::HashMap, path::{Path, PathBuf}, process::Stdio, sync::{Ar
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{interval, Duration};
+use punchclock_common::{InboxResponse, RegisterResponse, TaskSyncItem, TaskSyncRequest, TeamResponse};
 
 use crate::tui::{spawn_tui, TuiEvent};
 
@@ -164,21 +165,6 @@ fn repo_name(root: &Path) -> String {
 
 // ── task sync ─────────────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
-struct TaskSyncItem {
-    id: String,
-    title: String,
-    status: String,
-    modified_at: String,
-}
-
-#[derive(Serialize)]
-struct TaskSyncPayload {
-    agent_id: String,
-    hash: u64,
-    tasks: Vec<TaskSyncItem>,
-}
-
 fn task_dir_hash(root: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -274,34 +260,6 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
-// ── server response types ─────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct RegisterResponse {
-    agent_id: String,
-}
-
-#[derive(Deserialize)]
-struct TeamResponse {
-    agents: Vec<AgentSummary>,
-}
-
-#[derive(Deserialize)]
-struct AgentSummary {
-    id: String,
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct InboxResponse {
-    messages: Vec<MessageItem>,
-}
-
-#[derive(Deserialize)]
-struct MessageItem {
-    from: String,
-    body: String,
-}
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
@@ -368,13 +326,11 @@ pub async fn run() -> anyhow::Result<()> {
     // register on first run if no agent_id yet; fall back to local UUID if server offline
     if config.agent_id.is_none() {
         let client = reqwest::Client::new();
-        let root_str = root.to_string_lossy().to_string();
         let id = match client
             .get(format!("{base}/register"))
             .query(&[
                 ("name", config.name.as_str()),
                 ("description", config.description.as_str()),
-                ("repo_path", root_str.as_str()),
             ])
             .send()
             .await
@@ -450,7 +406,6 @@ pub async fn run() -> anyhow::Result<()> {
     let hb_id = agent_id.clone();
     let hb_name = config.name.clone();
     let hb_desc = config.description.clone();
-    let hb_root = root_str.clone();
     let hb_connected = connected.clone();
     let hb_tx = tx.clone();
     tokio::spawn(async move {
@@ -464,7 +419,6 @@ pub async fn run() -> anyhow::Result<()> {
                     ("agent_id", hb_id.as_str()),
                     ("name", hb_name.as_str()),
                     ("description", hb_desc.as_str()),
-                    ("repo_path", hb_root.as_str()),
                 ])
                 .send()
                 .await
@@ -609,7 +563,7 @@ pub async fn run() -> anyhow::Result<()> {
             let hash = task_dir_hash(&sync_root);
             if hash == last_hash { continue; }
             let tasks = read_task_snapshot(&sync_root);
-            let payload = TaskSyncPayload { agent_id: sync_id.clone(), hash, tasks };
+            let payload = TaskSyncRequest { agent_id: sync_id.clone(), hash, tasks };
             if let Ok(r) = client.post(format!("{sync_base}/task/sync")).json(&payload).send().await {
                 if r.status().is_success() { last_hash = hash; }
             }
@@ -887,6 +841,87 @@ pub async fn stop() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── install helpers ───────────────────────────────────────────────────────────
+
+/// Sanitise a repo name into a string safe for service labels / file names.
+fn sanitize_name(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect()
+}
+
+/// Persistent per-repo log directory (survives reboots, doesn't clash with .punchclock file).
+/// Returns `~/.punchclock/<hash>/daemon.log`.
+fn install_log_path(repo_root: &Path) -> anyhow::Result<PathBuf> {
+    let hash = format!("{:x}", md5_path(repo_root));
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let dir = home.join(".punchclock").join(hash);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("daemon.log"))
+}
+
+// macOS helpers
+
+fn macos_plist_label(repo_name: &str) -> String {
+    format!("com.punchclock.{}", sanitize_name(repo_name))
+}
+
+fn macos_plist_path(label: &str) -> anyhow::Result<PathBuf> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let dir = home.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("{label}.plist")))
+}
+
+fn macos_plist_content(label: &str, exe: &Path, repo_root: &Path, log: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key>             <string>{label}</string>
+  <key>ProgramArguments</key>  <array>
+                                 <string>{exe}</string>
+                                 <string>agent</string>
+                                 <string>run</string>
+                               </array>
+  <key>WorkingDirectory</key>  <string>{repo}</string>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <true/>
+  <key>StandardOutPath</key>   <string>{log}</string>
+  <key>StandardErrorPath</key> <string>{log}</string>
+</dict></plist>
+"#,
+        exe = exe.display(),
+        repo = repo_root.display(),
+        log = log.display(),
+    )
+}
+
+// Linux helpers
+
+fn linux_service_name(repo_name: &str) -> String {
+    format!("punchclock-{}", sanitize_name(repo_name))
+}
+
+fn linux_service_path(svc_name: &str) -> anyhow::Result<PathBuf> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let dir = home.join(".config/systemd/user");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("{svc_name}.service")))
+}
+
+fn linux_service_content(svc_name: &str, exe: &Path, repo_root: &Path, log: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=punchclock agent for {svc_name}\nAfter=network.target\n\n\
+         [Service]\nExecStart={exe} agent run\nWorkingDirectory={repo}\nRestart=on-failure\n\
+         StandardOutput=append:{log}\nStandardError=append:{log}\n\n\
+         [Install]\nWantedBy=default.target\n",
+        exe = exe.display(),
+        repo = repo_root.display(),
+        log = log.display(),
+    )
+}
+
 // ── status ────────────────────────────────────────────────────────────────────
 
 pub async fn status() -> anyhow::Result<()> {
@@ -938,5 +973,118 @@ pub async fn status() -> anyhow::Result<()> {
             println!("OFFLINE  {}  ({})", agent_id, daemon);
         }
     }
+    Ok(())
+}
+
+// ── install / uninstall / logs ────────────────────────────────────────────────
+
+pub async fn install() -> anyhow::Result<()> {
+    let root = find_repo_root()?;
+    let name = repo_name(&root);
+    let exe = std::env::current_exe().context("cannot determine executable path")?;
+    let log = install_log_path(&root)?;
+
+    match std::env::consts::OS {
+        "macos" => {
+            let label = macos_plist_label(&name);
+            let plist = macos_plist_path(&label)?;
+            std::fs::write(&plist, macos_plist_content(&label, &exe, &root, &log))?;
+            let status = std::process::Command::new("launchctl")
+                .args(["load", "-w", &plist.to_string_lossy()])
+                .status()
+                .context("failed to run launchctl")?;
+            if !status.success() {
+                bail!("launchctl load failed — check the plist at {}", plist.display());
+            }
+            println!("installed  {}", plist.display());
+            println!("service    {label}");
+            println!("log        {}", log.display());
+        }
+        "linux" => {
+            let svc = linux_service_name(&name);
+            let svc_path = linux_service_path(&svc)?;
+            std::fs::write(&svc_path, linux_service_content(&svc, &exe, &root, &log))?;
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", &svc])
+                .status()
+                .context("failed to run systemctl")?;
+            if !status.success() {
+                bail!("systemctl enable failed — check the unit at {}", svc_path.display());
+            }
+            println!("installed  {}", svc_path.display());
+            println!("service    {svc}");
+            println!("log        {}", log.display());
+        }
+        other => bail!("OS daemon installation is not supported on {other}"),
+    }
+
+    println!("\nRun `punchclock agent logs` to follow the log.");
+    Ok(())
+}
+
+pub async fn uninstall() -> anyhow::Result<()> {
+    let root = find_repo_root()?;
+    let name = repo_name(&root);
+
+    match std::env::consts::OS {
+        "macos" => {
+            let label = macos_plist_label(&name);
+            let plist = macos_plist_path(&label)?;
+            if plist.exists() {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["unload", "-w", &plist.to_string_lossy()])
+                    .status();
+                std::fs::remove_file(&plist)?;
+                println!("removed  {}", plist.display());
+            } else {
+                println!("not installed (expected plist at {})", plist.display());
+            }
+        }
+        "linux" => {
+            let svc = linux_service_name(&name);
+            let svc_path = linux_service_path(&svc)?;
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "disable", "--now", &svc])
+                .status();
+            if svc_path.exists() {
+                std::fs::remove_file(&svc_path)?;
+                println!("removed  {}", svc_path.display());
+            } else {
+                println!("not installed (expected unit at {})", svc_path.display());
+            }
+        }
+        other => bail!("OS daemon management is not supported on {other}"),
+    }
+
+    Ok(())
+}
+
+pub async fn logs() -> anyhow::Result<()> {
+    let root = find_repo_root()?;
+    let log = install_log_path(&root)?;
+
+    // Fall back to the runtime log used by `agent start` if the install log doesn't exist yet.
+    let log = if log.exists() {
+        log
+    } else {
+        let fallback = runtime_dir(&root).join("daemon.log");
+        if fallback.exists() {
+            fallback
+        } else {
+            bail!(
+                "no log file found — run `punchclock agent install` or `punchclock agent start` first\n\
+                 (looked in {} and {})",
+                log.display(),
+                fallback.display()
+            );
+        }
+    };
+
+    println!("tailing {}", log.display());
+    let mut child = std::process::Command::new("tail")
+        .args(["-f", &log.to_string_lossy().into_owned()])
+        .spawn()
+        .context("failed to run tail")?;
+    child.wait()?;
     Ok(())
 }

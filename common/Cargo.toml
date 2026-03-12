@@ -1,0 +1,11 @@
+[package]
+name = "punchclock-common"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+poem-openapi = ["dep:poem-openapi"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+poem-openapi = { version = "5", optional = true }

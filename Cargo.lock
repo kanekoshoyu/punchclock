@@ -1495,6 +1495,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "dotenvy",
+ "punchclock-common",
  "ratatui",
  "reqwest",
  "serde",
@@ -1506,6 +1507,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "punchclock-common"
+version = "0.1.0"
+dependencies = [
+ "poem-openapi",
+ "serde",
+]
+
+[[package]]
 name = "punchclock-server"
 version = "0.2.0"
 dependencies = [
@@ -1513,7 +1522,10 @@ dependencies = [
  "dotenvy",
  "poem",
  "poem-openapi",
+ "punchclock-common",
+ "reqwest",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

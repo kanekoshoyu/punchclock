@@ -33,3 +33,22 @@ Start with **A** as the simplest unblock for remote deployments, with the
 understanding that the filesystem remains the source of truth for the daemon
 and `task/list` is eventually-consistent. Remove `repo_path`-based filesystem
 reads from the server entirely.
+
+## Result
+
+Clean build. The remaining warnings are pre-existing dead-code warnings unrelated to this change.
+
+**Summary of changes:**
+
+- **Server** (`server/src/main.rs`):
+  - Removed `repo_path` field from `AgentRecord`
+  - Removed `repo_path` parameter from `GET /register` and `GET /heartbeat`
+  - Removed the filesystem read block from `task_list` — it now reads the daemon-pushed snapshot first, then falls back to in-memory tasks from `task/push`
+  - Removed the `extract_section` helper (only used by the filesystem read)
+  - Updated the landing page to reflect the change
+
+- **Client** (`client/src/agent.rs`):
+  - Removed `repo_path` from the `/register` call
+  - Removed `repo_path` (and the `hb_root` variable) from the heartbeat query
+
+The daemon's `task/sync` loop (already implemented) is now the only path for `task/list` to see filesystem-based tasks, making the server remote-deployment safe.

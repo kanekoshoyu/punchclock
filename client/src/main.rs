@@ -2,7 +2,9 @@ mod agent;
 mod tui;
 
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use punchclock_common::{
+    BroadcastResponse, InboxResponse, RegisterResponse, TaskItem, TaskListResponse, TeamResponse,
+};
 
 const DEFAULT_SERVER: &str = "http://localhost:8421";
 
@@ -84,6 +86,12 @@ enum AgentCmd {
     Stop,
     /// Show whether this repo's agent is online
     Status,
+    /// Register the daemon as an OS-level service (launchd / systemd)
+    Install,
+    /// Unregister and remove the OS-level service unit
+    Uninstall,
+    /// Tail the daemon log file
+    Logs,
 }
 
 #[derive(Subcommand)]
@@ -105,58 +113,6 @@ enum TaskCmd {
     },
 }
 
-// ── response types (mirrors server) ──────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct RegisterResponse {
-    agent_id: String,
-}
-
-#[derive(Deserialize)]
-struct AgentSummary {
-    id: String,
-    name: String,
-    description: String,
-}
-
-#[derive(Deserialize)]
-struct TeamResponse {
-    agents: Vec<AgentSummary>,
-}
-
-#[derive(Deserialize)]
-struct MessageItem {
-    from: String,
-    body: String,
-    timestamp: String,
-}
-
-#[derive(Deserialize)]
-struct InboxResponse {
-    messages: Vec<MessageItem>,
-}
-
-#[derive(Deserialize)]
-struct BroadcastResponse {
-    delivered: usize,
-}
-
-#[derive(Deserialize)]
-struct TaskItem {
-    id: String,
-    agent_id: String,
-    title: String,
-    status: String,
-    created_at: String,
-    started_at: Option<String>,
-    finished_at: Option<String>,
-    result: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TaskListResponse {
-    tasks: Vec<TaskItem>,
-}
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
@@ -347,6 +303,9 @@ async fn main() -> anyhow::Result<()> {
             AgentCmd::Start => agent::start().await?,
             AgentCmd::Stop => agent::stop().await?,
             AgentCmd::Status => agent::status().await?,
+            AgentCmd::Install => agent::install().await?,
+            AgentCmd::Uninstall => agent::uninstall().await?,
+            AgentCmd::Logs => agent::logs().await?,
         },
     }
 

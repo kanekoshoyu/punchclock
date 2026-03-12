@@ -63,3 +63,19 @@ Then run `systemctl --user enable --now punchclock-<repo>`.
 - `punchclock agent install` — write and load/enable the unit
 - `punchclock agent uninstall` — unload/disable and remove the unit
 - `punchclock agent logs` — tail `.punchclock/daemon.log`
+
+## Result
+
+All three commands are visible and the build is clean. Here's a summary of what was added:
+
+**`punchclock agent install`**
+- macOS: generates `~/Library/LaunchAgents/com.punchclock.<repo>.plist` and runs `launchctl load -w`
+- Linux: generates `~/.config/systemd/user/punchclock-<repo>.service` and runs `systemctl --user enable --now`
+- Logs go to `~/.punchclock/<repo-hash>/daemon.log` (persistent across reboots; avoids the `.punchclock` config file path conflict)
+
+**`punchclock agent uninstall`**
+- macOS: `launchctl unload -w` then removes the plist
+- Linux: `systemctl --user disable --now` then removes the unit file
+
+**`punchclock agent logs`**
+- Tails the install log (`~/.punchclock/<hash>/daemon.log`), falling back to the `start` log (`/tmp/punchclock-<hash>/daemon.log`) if the install log doesn't exist yet
