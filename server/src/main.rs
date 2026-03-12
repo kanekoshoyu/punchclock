@@ -72,6 +72,11 @@ struct InboxResponse {
 }
 
 #[derive(Object)]
+struct BroadcastResponse {
+    delivered: usize,
+}
+
+#[derive(Object)]
 struct ErrorBody {
     error: String,
 }
@@ -190,6 +195,47 @@ impl PunchclockApi {
                 error: format!("agent {} not found", to.0),
             })),
         }
+    }
+
+    /// Broadcast a message to all currently-online agents.
+    ///
+    /// Delivers to every agent whose last heartbeat is within the timeout window.
+    /// Returns the count of inboxes that received the message.
+    #[oai(path = "/message/broadcast", method = "get")]
+    async fn broadcast(
+        &self,
+        state: poem::web::Data<&SharedState>,
+        /// Sender agent ID (or any label identifying the sender)
+        from: Query<String>,
+        /// Message text
+        body: Query<String>,
+    ) -> Json<BroadcastResponse> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS);
+        let live_ids: Vec<String> = state
+            .agents
+            .read()
+            .await
+            .values()
+            .filter(|a| a.last_heartbeat > cutoff)
+            .map(|a| a.id.clone())
+            .collect();
+
+        let mut inboxes = state.inboxes.write().await;
+        let mut delivered = 0usize;
+        for id in &live_ids {
+            if let Some(inbox) = inboxes.get_mut(id) {
+                if inbox.len() >= MAX_INBOX {
+                    inbox.pop_front();
+                }
+                inbox.push_back(Message {
+                    from: from.0.clone(),
+                    body: body.0.clone(),
+                    timestamp: Utc::now(),
+                });
+                delivered += 1;
+            }
+        }
+        Json(BroadcastResponse { delivered })
     }
 
     /// Drain and return all pending messages for an agent.

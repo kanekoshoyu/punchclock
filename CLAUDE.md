@@ -29,3 +29,4 @@ cargo test                           # run all tests
 - Keep server and client response types in sync manually (no shared crate yet).
 - Use `tracing::info!` / `tracing::warn!` for structured logs, not `println!`.
 - Error responses use `{"error": "<message>"}` JSON body.
+- Use `git mv` (never plain `mv`) when moving files between `.task/todo/` and `.task/done/`.

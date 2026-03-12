@@ -35,6 +35,19 @@ enum Cmd {
     },
     /// Receive (and drain) your inbox
     Inbox { agent_id: String },
+    /// Poll inbox and print messages as they arrive
+    Watch {
+        agent_id: String,
+        /// Poll interval in seconds
+        #[arg(long, default_value = "5")]
+        interval: u64,
+    },
+    /// Broadcast a message to all online agents
+    Broadcast {
+        #[arg(long)]
+        from: String,
+        body: String,
+    },
 }
 
 // ── response types (mirrors server) ──────────────────────────────────────────
@@ -66,6 +79,11 @@ struct MessageItem {
 #[derive(Deserialize)]
 struct InboxResponse {
     messages: Vec<MessageItem>,
+}
+
+#[derive(Deserialize)]
+struct BroadcastResponse {
+    delivered: usize,
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -145,6 +163,36 @@ async fn main() -> anyhow::Result<()> {
                     println!("[{}] from {}: {}", m.timestamp, m.from, m.body);
                 }
             }
+        }
+
+        Cmd::Watch { agent_id, interval } => {
+            let period = tokio::time::Duration::from_secs(*interval);
+            loop {
+                let res: InboxResponse = client
+                    .get(format!("{base}/message/recv"))
+                    .query(&[("agent_id", agent_id)])
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                for m in &res.messages {
+                    println!("[{}] from {}: {}", m.timestamp, m.from, m.body);
+                }
+                tokio::time::sleep(period).await;
+            }
+        }
+
+        Cmd::Broadcast { from, body } => {
+            let res: BroadcastResponse = client
+                .get(format!("{base}/message/broadcast"))
+                .query(&[("from", from), ("body", body)])
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            println!("broadcast delivered to {} agent(s)", res.delivered);
         }
     }
 
