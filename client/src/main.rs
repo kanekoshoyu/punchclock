@@ -8,9 +8,9 @@ const DEFAULT_SERVER: &str = "http://localhost:8421";
 #[derive(Parser)]
 #[command(name = "punchclock", about = "Punchclock agent orchestration client")]
 struct Cli {
-    /// Punchclock server base URL
-    #[arg(long, env = "API_BASE_URL", default_value = DEFAULT_SERVER)]
-    server: String,
+    /// Punchclock server base URL (overrides .punchclock)
+    #[arg(long, env = "API_BASE_URL")]
+    server: Option<String>,
 
     #[command(subcommand)]
     command: Cmd,
@@ -24,30 +24,39 @@ enum Cmd {
         description: String,
     },
     /// Send a heartbeat to stay online
-    Heartbeat { agent_id: String },
+    Heartbeat {
+        /// Agent ID (defaults to .punchclock)
+        agent_id: Option<String>,
+    },
     /// List all online agents
     Team,
     /// Send a message to another agent
     Send {
+        /// Sender agent ID (defaults to .punchclock)
         #[arg(long)]
-        from: String,
+        from: Option<String>,
         #[arg(long)]
         to: String,
         body: String,
     },
     /// Receive (and drain) your inbox
-    Inbox { agent_id: String },
+    Inbox {
+        /// Agent ID (defaults to .punchclock)
+        agent_id: Option<String>,
+    },
     /// Poll inbox and print messages as they arrive
     Watch {
-        agent_id: String,
+        /// Agent ID (defaults to .punchclock)
+        agent_id: Option<String>,
         /// Poll interval in seconds
         #[arg(long, default_value = "5")]
         interval: u64,
     },
     /// Broadcast a message to all online agents
     Broadcast {
+        /// Sender agent ID (defaults to .punchclock)
         #[arg(long)]
-        from: String,
+        from: Option<String>,
         body: String,
     },
     /// Manage tasks in an agent's queue
@@ -66,8 +75,12 @@ enum Cmd {
 enum AgentCmd {
     /// Register this repo as an agent and write .punchclock/agent.toml
     Init,
-    /// Start the routing daemon (heartbeat + poll + forward to claude CLI)
+    /// Run the daemon in the foreground (heartbeat + poll + forward to claude CLI)
     Run,
+    /// Start the daemon in the background (writes .punchclock/daemon.pid)
+    Start,
+    /// Stop a running background daemon
+    Stop,
     /// Show whether this repo's agent is online
     Status,
 }
@@ -76,9 +89,9 @@ enum AgentCmd {
 enum TaskCmd {
     /// Push a task onto an agent's queue
     Push {
-        /// Target agent ID
+        /// Target agent ID (defaults to .punchclock)
         #[arg(long)]
-        to: String,
+        to: Option<String>,
         /// Short title
         title: String,
         /// Full task body (sent to Claude)
@@ -86,7 +99,8 @@ enum TaskCmd {
     },
     /// List all tasks for an agent
     List {
-        agent_id: String,
+        /// Agent ID (defaults to .punchclock)
+        agent_id: Option<String>,
     },
 }
 
@@ -150,7 +164,41 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")); // ok if absent
     let cli = Cli::parse();
     let client = reqwest::Client::new();
-    let base = cli.server.trim_end_matches('/');
+
+    // load .punchclock if present — used as fallback for agent_id, server, from
+    let local = agent::AgentConfig::load_optional();
+
+    let base = cli
+        .server
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| local.as_ref().map(|c| c.server.clone()))
+        .unwrap_or_else(|| DEFAULT_SERVER.to_string());
+    let base = base.trim_end_matches('/');
+
+    // resolve agent_id: provided arg → .punchclock → error
+    let resolve_id = |provided: Option<&String>| -> anyhow::Result<String> {
+        provided
+            .cloned()
+            .or_else(|| local.as_ref().map(|c| c.agent_id.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "agent_id required — provide it as an argument or run `punchclock agent init`"
+                )
+            })
+    };
+
+    // resolve --from: same fallback as agent_id
+    let resolve_from = |provided: Option<&String>| -> anyhow::Result<String> {
+        provided
+            .cloned()
+            .or_else(|| local.as_ref().map(|c| c.agent_id.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--from required — provide it or run `punchclock agent init`"
+                )
+            })
+    };
 
     match &cli.command {
         Cmd::Register { name, description } => {
@@ -166,9 +214,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Cmd::Heartbeat { agent_id } => {
+            let id = resolve_id(agent_id.as_ref())?;
             client
                 .get(format!("{base}/heartbeat"))
-                .query(&[("agent_id", agent_id)])
+                .query(&[("agent_id", &id)])
                 .send()
                 .await?
                 .error_for_status()?;
@@ -195,9 +244,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Cmd::Send { from, to, body } => {
+            let from = resolve_from(from.as_ref())?;
             client
                 .get(format!("{base}/message/send"))
-                .query(&[("to", to), ("from", from), ("body", body)])
+                .query(&[("to", to), ("from", &from), ("body", body)])
                 .send()
                 .await?
                 .error_for_status()?;
@@ -205,9 +255,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Cmd::Inbox { agent_id } => {
+            let id = resolve_id(agent_id.as_ref())?;
             let res: InboxResponse = client
                 .get(format!("{base}/message/recv"))
-                .query(&[("agent_id", agent_id)])
+                .query(&[("agent_id", &id)])
                 .send()
                 .await?
                 .error_for_status()?
@@ -223,11 +274,12 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Cmd::Watch { agent_id, interval } => {
+            let id = resolve_id(agent_id.as_ref())?;
             let period = tokio::time::Duration::from_secs(*interval);
             loop {
                 let res: InboxResponse = client
                     .get(format!("{base}/message/recv"))
-                    .query(&[("agent_id", agent_id)])
+                    .query(&[("agent_id", &id)])
                     .send()
                     .await?
                     .error_for_status()?
@@ -241,9 +293,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Cmd::Broadcast { from, body } => {
+            let from = resolve_from(from.as_ref())?;
             let res: BroadcastResponse = client
                 .get(format!("{base}/message/broadcast"))
-                .query(&[("from", from), ("body", body)])
+                .query(&[("from", &from), ("body", body)])
                 .send()
                 .await?
                 .error_for_status()?
@@ -254,9 +307,10 @@ async fn main() -> anyhow::Result<()> {
 
         Cmd::Task { cmd } => match cmd {
             TaskCmd::Push { to, title, body } => {
+                let to = resolve_id(to.as_ref())?;
                 let item: TaskItem = client
                     .get(format!("{base}/task/push"))
-                    .query(&[("agent_id", to), ("title", title), ("body", body)])
+                    .query(&[("agent_id", &to), ("title", title), ("body", body)])
                     .send()
                     .await?
                     .error_for_status()?
@@ -265,9 +319,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("task queued  id: {}  agent: {}", item.id, item.agent_id);
             }
             TaskCmd::List { agent_id } => {
+                let id = resolve_id(agent_id.as_ref())?;
                 let res: TaskListResponse = client
                     .get(format!("{base}/task/list"))
-                    .query(&[("agent_id", agent_id)])
+                    .query(&[("agent_id", &id)])
                     .send()
                     .await?
                     .error_for_status()?
@@ -288,6 +343,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Agent { cmd } => match cmd {
             AgentCmd::Init => agent::init().await?,
             AgentCmd::Run => agent::run().await?,
+            AgentCmd::Start => agent::start().await?,
+            AgentCmd::Stop => agent::stop().await?,
             AgentCmd::Status => agent::status().await?,
         },
     }

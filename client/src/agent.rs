@@ -6,6 +6,42 @@ use std::{collections::HashMap, path::{Path, PathBuf}, process::Stdio};
 use tokio::process::Command;
 use tokio::time::{interval, Duration};
 
+// ── PID file ──────────────────────────────────────────────────────────────────
+
+fn runtime_dir(repo_root: &Path) -> PathBuf {
+    let hash = format!("{:x}", md5_path(repo_root));
+    std::env::temp_dir().join(format!("punchclock-{hash}"))
+}
+
+fn md5_path(p: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    p.hash(&mut h);
+    h.finish()
+}
+
+fn pid_path(repo_root: &Path) -> PathBuf {
+    runtime_dir(repo_root).join("daemon.pid")
+}
+
+fn write_pid(repo_root: &Path) -> anyhow::Result<()> {
+    let dir = runtime_dir(repo_root);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(pid_path(repo_root), std::process::id().to_string())?;
+    Ok(())
+}
+
+fn remove_pid(repo_root: &Path) {
+    let _ = std::fs::remove_file(pid_path(repo_root));
+}
+
+fn read_pid(repo_root: &Path) -> anyhow::Result<u32> {
+    let s = std::fs::read_to_string(pid_path(repo_root))
+        .context("daemon not running (try `punchclock agent start`)")?;
+    s.trim().parse::<u32>().context("daemon PID file is corrupt")
+}
+
 // ── config ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,17 +56,21 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     pub fn load(repo_root: &Path) -> anyhow::Result<Self> {
-        let path = repo_root.join(".punchclock/agent.toml");
+        let path = repo_root.join(".punchclock");
         let text = std::fs::read_to_string(&path).with_context(|| {
             format!("cannot read {path:?} — run `punchclock agent init` first")
         })?;
-        toml::from_str(&text).context("invalid agent.toml")
+        toml::from_str(&text).context("invalid .punchclock")
+    }
+
+    /// Load config from the nearest git repo root, returning None if not found.
+    pub fn load_optional() -> Option<Self> {
+        let root = find_repo_root().ok()?;
+        Self::load(&root).ok()
     }
 
     pub fn save(&self, repo_root: &Path) -> anyhow::Result<()> {
-        let dir = repo_root.join(".punchclock");
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("agent.toml"), toml::to_string_pretty(self)?)?;
+        std::fs::write(repo_root.join(".punchclock"), toml::to_string_pretty(self)?)?;
         Ok(())
     }
 }
@@ -66,11 +106,7 @@ questions:
     default: ""
 "#;
 
-fn load_template(repo_root: &Path) -> anyhow::Result<Template> {
-    let repo_tmpl = repo_root.join(".punchclock/template.yaml");
-    if repo_tmpl.exists() {
-        return Ok(serde_yaml::from_str(&std::fs::read_to_string(repo_tmpl)?)?);
-    }
+fn load_template() -> anyhow::Result<Template> {
     if let Some(home) = dirs::home_dir() {
         let user_tmpl = home.join(".punchclock/templates/default.yaml");
         if user_tmpl.exists() {
@@ -158,7 +194,7 @@ pub async fn init() -> anyhow::Result<()> {
     let root = find_repo_root()?;
     let rname = repo_name(&root);
     let vars = [("repo_name", rname.as_str())];
-    let template = load_template(&root)?;
+    let template = load_template()?;
     let theme = ColorfulTheme::default();
 
     println!("Setting up punchclock agent for: {rname}\n");
@@ -203,8 +239,20 @@ pub async fn init() -> anyhow::Result<()> {
     };
     config.save(&root)?;
 
+    // ensure .punchclock is gitignored
+    let gitignore_path = root.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    if !existing.lines().any(|l| l.trim() == ".punchclock") {
+        let mut content = existing;
+        if !content.ends_with('\n') && !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(".punchclock\n");
+        std::fs::write(&gitignore_path, content)?;
+    }
+
     println!("\nagent_id : {}", res.agent_id);
-    println!("config   : .punchclock/agent.toml");
+    println!("config   : .punchclock");
     println!("\nRun `punchclock agent run` to start the daemon.");
     Ok(())
 }
@@ -222,6 +270,13 @@ pub async fn run() -> anyhow::Result<()> {
     eprintln!("agent    : {} ({})", config.name, agent_id);
     eprintln!("server   : {base}");
     eprintln!("routing messages + tasks → claude CLI\n");
+
+    write_pid(&root)?;
+    let root_for_cleanup = root.clone();
+    // remove PID file on exit via a drop guard
+    struct PidGuard(PathBuf);
+    impl Drop for PidGuard { fn drop(&mut self) { remove_pid(&self.0); } }
+    let _pid_guard = PidGuard(root_for_cleanup);
 
     // background heartbeat
     let hb_base = base.clone();
@@ -257,8 +312,10 @@ pub async fn run() -> anyhow::Result<()> {
         let mut ticker = interval(Duration::from_secs(5));
         let todo_dir = std::path::Path::new(&task_root).join(".task/todo");
         let done_dir = std::path::Path::new(&task_root).join(".task/done");
+        let blocked_dir = std::path::Path::new(&task_root).join(".task/blocked");
         let _ = std::fs::create_dir_all(&todo_dir);
         let _ = std::fs::create_dir_all(&done_dir);
+        let _ = std::fs::create_dir_all(&blocked_dir);
         loop {
             ticker.tick().await;
             // claim next queued task
@@ -289,23 +346,39 @@ pub async fn run() -> anyhow::Result<()> {
 
             // run claude with the task body as the prompt
             let reply = route_to_claude(&body, &task_flags, &task_root).await;
-            let status = if reply.starts_with("[claude exited") || reply.starts_with("[failed") {
-                "failed"
-            } else {
-                "done"
-            };
+
+            // detect BLOCKED: <reason> as the first line of output
+            let (status, dest_dir, section_heading) =
+                if let Some(reason) = reply.strip_prefix("BLOCKED:") {
+                    ("blocked", &blocked_dir, "Blocked")
+                } else if reply.starts_with("[claude exited") || reply.starts_with("[failed") {
+                    ("failed", &done_dir, "Result")
+                } else {
+                    ("done", &done_dir, "Result")
+                };
             eprintln!("✓ task [{tid}] {status} ({} chars)", reply.len());
 
-            // git mv todo → done, append result
-            let done_file = done_dir.join(format!("{tid}.md"));
+            // git mv todo → dest (.task/done/ or .task/blocked/)
+            let dest_file = dest_dir.join(format!("{tid}.md"));
             let _ = std::process::Command::new("git")
-                .args(["mv", &todo_file.to_string_lossy(), &done_file.to_string_lossy()])
+                .args(["mv", &todo_file.to_string_lossy(), &dest_file.to_string_lossy()])
                 .current_dir(&task_root)
                 .output();
-            // append result to the done file
-            if let Ok(mut content) = std::fs::read_to_string(&done_file) {
-                content.push_str(&format!("\n## Result\n\n{reply}\n"));
-                let _ = std::fs::write(&done_file, content);
+            // append result/reason to the dest file
+            if let Ok(mut content) = std::fs::read_to_string(&dest_file) {
+                content.push_str(&format!("\n## {section_heading}\n\n{reply}\n"));
+                let _ = std::fs::write(&dest_file, content);
+            }
+
+            // notify server of blocked status with the reason
+            if status == "blocked" {
+                let reason = reply.strip_prefix("BLOCKED:").unwrap_or(&reply).trim().to_string();
+                let _ = client
+                    .get(format!("{task_base}/task/block"))
+                    .query(&[("task_id", &tid), ("reason", &reason)])
+                    .send()
+                    .await;
+                continue;
             }
 
             let _ = client
@@ -316,11 +389,17 @@ pub async fn run() -> anyhow::Result<()> {
         }
     });
 
-    // message poll loop
+    // message poll loop — exits cleanly on SIGINT or SIGTERM
     let client = reqwest::Client::new();
     let mut poll = interval(Duration::from_secs(5));
     loop {
-        poll.tick().await;
+        tokio::select! {
+            _ = poll.tick() => {}
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nshutting down…");
+                break;
+            }
+        }
 
         let inbox: InboxResponse = match client
             .get(format!("{base}/message/recv"))
@@ -353,6 +432,7 @@ pub async fn run() -> anyhow::Result<()> {
                 .await;
         }
     }
+    Ok(())
 }
 
 async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
@@ -377,6 +457,76 @@ async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
     }
 }
 
+// ── start / stop ──────────────────────────────────────────────────────────────
+
+pub async fn start() -> anyhow::Result<()> {
+    let root = find_repo_root()?;
+
+    // refuse to double-start
+    if let Ok(pid) = read_pid(&root) {
+        // check if the process is actually alive
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if alive {
+            bail!("daemon already running (PID {pid}) — use `punchclock agent stop` first");
+        }
+        // stale PID file — remove and proceed
+        remove_pid(&root);
+    }
+
+    let exe = std::env::current_exe().context("cannot determine current executable path")?;
+    let log_path = runtime_dir(&root).join("daemon.log");
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&log_path)?;
+
+    std::process::Command::new(&exe)
+        .args(["agent", "run"])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .spawn()
+        .context("failed to spawn daemon")?;
+
+    // brief pause so the daemon can write its PID file
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    match read_pid(&root) {
+        Ok(pid) => println!("daemon started  PID {pid}  log → {}", log_path.display()),
+        Err(_)  => println!("daemon spawned  log → {}", log_path.display()),
+    }
+    Ok(())
+}
+
+pub async fn stop() -> anyhow::Result<()> {
+    let root = find_repo_root()?;
+    let pid = read_pid(&root)?;
+
+    // SIGTERM — ask the daemon to finish cleanly
+    let result = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output();
+
+    match result {
+        Ok(o) if o.status.success() => {
+            println!("sent SIGTERM to PID {pid}");
+            remove_pid(&root);
+        }
+        Ok(_) => {
+            // process already gone — clean up stale PID file
+            remove_pid(&root);
+            println!("daemon was not running (stale PID {pid}) — cleaned up");
+        }
+        Err(e) => bail!("failed to send signal: {e}"),
+    }
+    Ok(())
+}
+
 // ── status ────────────────────────────────────────────────────────────────────
 
 pub async fn status() -> anyhow::Result<()> {
@@ -393,12 +543,32 @@ pub async fn status() -> anyhow::Result<()> {
         .json()
         .await?;
 
+    let daemon_pid = read_pid(&root).ok();
+    let daemon_alive = daemon_pid.map(|pid| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
+
     match res.agents.iter().find(|a| a.id == config.agent_id) {
-        Some(a) => println!("ONLINE   {}  {}", a.id, a.name),
-        None => println!(
-            "OFFLINE  {} — not on team (server may have restarted, run `agent init` again)",
-            config.agent_id
-        ),
+        Some(a) => {
+            let daemon = match daemon_alive {
+                Some(true)  => format!("daemon PID {}", daemon_pid.unwrap()),
+                Some(false) => "daemon dead (stale PID file)".to_string(),
+                None        => "daemon not running".to_string(),
+            };
+            println!("ONLINE   {}  {}  ({})", a.id, a.name, daemon);
+        }
+        None => {
+            let daemon = match daemon_alive {
+                Some(true)  => format!("daemon PID {} running but agent not on team (server restarted?)", daemon_pid.unwrap()),
+                Some(false) => "daemon dead (stale PID file)".to_string(),
+                None        => "daemon not running — use `punchclock agent start`".to_string(),
+            };
+            println!("OFFLINE  {}  ({})", config.agent_id, daemon);
+        }
     }
     Ok(())
 }
