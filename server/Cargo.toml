@@ -1,0 +1,19 @@
+[package]
+name = "punchclock-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "punchclock-server"
+path = "src/main.rs"
+
+[dependencies]
+poem = "3"
+poem-openapi = { version = "5", features = ["swagger-ui"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
