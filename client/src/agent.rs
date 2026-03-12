@@ -46,7 +46,8 @@ fn read_pid(repo_root: &Path) -> anyhow::Result<u32> {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
-    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     pub name: String,
     pub description: String,
     pub server: String,
@@ -217,21 +218,8 @@ pub async fn init() -> anyhow::Result<()> {
         .unwrap_or_else(|| "http://localhost:8421".to_string());
     let claude_flags = answers.get("claude_flags").cloned().unwrap_or_default();
 
-    print!("\nRegistering with server at {server}... ");
-    let client = reqwest::Client::new();
-    let root_str = root.to_string_lossy().to_string();
-    let res: RegisterResponse = client
-        .get(format!("{}/register", server.trim_end_matches('/')))
-        .query(&[("name", &name), ("description", &description), ("repo_path", &root_str)])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    println!("done");
-
     let config = AgentConfig {
-        agent_id: res.agent_id.clone(),
+        agent_id: None,
         name,
         description,
         server,
@@ -251,9 +239,8 @@ pub async fn init() -> anyhow::Result<()> {
         std::fs::write(&gitignore_path, content)?;
     }
 
-    println!("\nagent_id : {}", res.agent_id);
-    println!("config   : .punchclock");
-    println!("\nRun `punchclock agent run` to start the daemon.");
+    println!("\nconfig   : .punchclock");
+    println!("\nRun `punchclock agent run` to register and start the daemon.");
     Ok(())
 }
 
@@ -261,9 +248,32 @@ pub async fn init() -> anyhow::Result<()> {
 
 pub async fn run() -> anyhow::Result<()> {
     let root = find_repo_root()?;
-    let config = AgentConfig::load(&root)?;
+    let mut config = AgentConfig::load(&root)?;
     let base = config.server.trim_end_matches('/').to_string();
-    let agent_id = config.agent_id.clone();
+
+    // register on first run if no agent_id yet
+    if config.agent_id.is_none() {
+        eprint!("registering with {}... ", base);
+        let client = reqwest::Client::new();
+        let root_str = root.to_string_lossy().to_string();
+        let res: RegisterResponse = client
+            .get(format!("{base}/register"))
+            .query(&[
+                ("name", config.name.as_str()),
+                ("description", config.description.as_str()),
+                ("repo_path", root_str.as_str()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        eprintln!("done  agent_id: {}", res.agent_id);
+        config.agent_id = Some(res.agent_id);
+        config.save(&root)?;
+    }
+
+    let agent_id = config.agent_id.clone().unwrap();
     let claude_flags = config.claude_flags.clone();
     let root_str = root.to_string_lossy().to_string();
 
@@ -552,7 +562,15 @@ pub async fn status() -> anyhow::Result<()> {
             .unwrap_or(false)
     });
 
-    match res.agents.iter().find(|a| a.id == config.agent_id) {
+    let agent_id = match &config.agent_id {
+        Some(id) => id.clone(),
+        None => {
+            println!("NOT REGISTERED — run `punchclock agent run` to register");
+            return Ok(());
+        }
+    };
+
+    match res.agents.iter().find(|a| a.id == agent_id) {
         Some(a) => {
             let daemon = match daemon_alive {
                 Some(true)  => format!("daemon PID {}", daemon_pid.unwrap()),
@@ -567,7 +585,7 @@ pub async fn status() -> anyhow::Result<()> {
                 Some(false) => "daemon dead (stale PID file)".to_string(),
                 None        => "daemon not running — use `punchclock agent start`".to_string(),
             };
-            println!("OFFLINE  {}  ({})", config.agent_id, daemon);
+            println!("OFFLINE  {}  ({})", agent_id, daemon);
         }
     }
     Ok(())

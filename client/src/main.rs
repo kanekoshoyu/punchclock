@@ -180,10 +180,10 @@ async fn main() -> anyhow::Result<()> {
     let resolve_id = |provided: Option<&String>| -> anyhow::Result<String> {
         provided
             .cloned()
-            .or_else(|| local.as_ref().map(|c| c.agent_id.clone()))
+            .or_else(|| local.as_ref().and_then(|c| c.agent_id.clone()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "agent_id required — provide it as an argument or run `punchclock agent init`"
+                    "agent_id required — provide it as an argument or run `punchclock agent run`"
                 )
             })
     };
@@ -192,10 +192,10 @@ async fn main() -> anyhow::Result<()> {
     let resolve_from = |provided: Option<&String>| -> anyhow::Result<String> {
         provided
             .cloned()
-            .or_else(|| local.as_ref().map(|c| c.agent_id.clone()))
+            .or_else(|| local.as_ref().and_then(|c| c.agent_id.clone()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--from required — provide it or run `punchclock agent init`"
+                    "--from required — provide it or run `punchclock agent run`"
                 )
             })
     };
