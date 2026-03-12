@@ -1,8 +1,7 @@
 use anyhow::{bail, Context};
 use dialoguer::{theme::ColorfulTheme, Input};
 use serde::{Deserialize, Serialize};
-use serde_json;
-use std::{collections::HashMap, path::{Path, PathBuf}, process::Stdio};
+use std::{collections::HashMap, path::{Path, PathBuf}, process::Stdio, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 use tokio::process::Command;
 use tokio::time::{interval, Duration};
 
@@ -160,6 +159,118 @@ fn repo_name(root: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+// ── task sync ─────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct TaskSyncItem {
+    id: String,
+    title: String,
+    status: String,
+    modified_at: String,
+}
+
+#[derive(Serialize)]
+struct TaskSyncPayload {
+    agent_id: String,
+    hash: u64,
+    tasks: Vec<TaskSyncItem>,
+}
+
+fn task_dir_hash(root: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    for subdir in &["todo", "done", "blocked"] {
+        let dir = std::path::Path::new(root).join(".task").join(subdir);
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let name = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mtime = entry.metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                    .unwrap_or(0);
+                entries.push((format!("{subdir}/{name}"), mtime));
+            }
+        }
+    }
+    entries.sort();
+    let mut h = DefaultHasher::new();
+    entries.hash(&mut h);
+    h.finish()
+}
+
+fn read_task_snapshot(root: &str) -> Vec<TaskSyncItem> {
+    let mut items = Vec::new();
+    for (subdir, status) in &[("todo", "queued"), ("done", "done"), ("blocked", "blocked")] {
+        let dir = std::path::Path::new(root).join(".task").join(subdir);
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let id = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let content = std::fs::read_to_string(&path).unwrap_or_default();
+                let title = content
+                    .lines()
+                    .find(|l| l.starts_with("# "))
+                    .map(|l| l.trim_start_matches("# ").to_string())
+                    .unwrap_or_else(|| id.clone());
+                // RFC3339-ish timestamp from mtime seconds since epoch
+                let modified_at = entry.metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        let secs = t.duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        // Simple ISO 8601 UTC: YYYY-MM-DDTHH:MM:SSZ
+                        let s = secs;
+                        let sec = s % 60;
+                        let min = (s / 60) % 60;
+                        let hr  = (s / 3600) % 24;
+                        let days = s / 86400;
+                        // days since 1970-01-01
+                        let (y, mo, d) = days_to_ymd(days);
+                        format!("{y:04}-{mo:02}-{d:02}T{hr:02}:{min:02}:{sec:02}Z")
+                    })
+                    .unwrap_or_default();
+                items.push(TaskSyncItem {
+                    id,
+                    title,
+                    status: status.to_string(),
+                    modified_at,
+                });
+            }
+        }
+    }
+    items
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Gregorian calendar calculation from Unix epoch days
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 // ── server response types ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -251,12 +362,11 @@ pub async fn run() -> anyhow::Result<()> {
     let mut config = AgentConfig::load(&root)?;
     let base = config.server.trim_end_matches('/').to_string();
 
-    // register on first run if no agent_id yet
+    // register on first run if no agent_id yet; fall back to local UUID if server offline
     if config.agent_id.is_none() {
-        eprint!("registering with {}... ", base);
         let client = reqwest::Client::new();
         let root_str = root.to_string_lossy().to_string();
-        let res: RegisterResponse = client
+        let id = match client
             .get(format!("{base}/register"))
             .query(&[
                 ("name", config.name.as_str()),
@@ -264,12 +374,20 @@ pub async fn run() -> anyhow::Result<()> {
                 ("repo_path", root_str.as_str()),
             ])
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        eprintln!("done  agent_id: {}", res.agent_id);
-        config.agent_id = Some(res.agent_id);
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(r) => match r.json::<RegisterResponse>().await {
+                Ok(res) => { eprintln!("registered  agent_id: {}", res.agent_id); res.agent_id }
+                Err(_) => uuid::Uuid::new_v4().to_string(),
+            },
+            Err(_) => {
+                let id = uuid::Uuid::new_v4().to_string();
+                eprintln!("server offline — local agent_id: {id}  (will register when connected)");
+                id
+            }
+        };
+        config.agent_id = Some(id);
         config.save(&root)?;
     }
 
@@ -281,6 +399,39 @@ pub async fn run() -> anyhow::Result<()> {
     eprintln!("server   : {base}");
     eprintln!("routing messages + tasks → claude CLI\n");
 
+    // show pending tasks on startup
+    {
+        let todo_dir = std::path::Path::new(&root_str).join(".task/todo");
+        let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&todo_dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+                let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH.into());
+                entries.push((path, mtime));
+            }
+        }
+        entries.sort_by_key(|(_, t)| *t);
+        let total = entries.len();
+        if total == 0 {
+            eprintln!("no tasks in .task/todo/");
+        } else {
+            eprintln!("{total} task(s) queued:");
+            for (path, _) in entries.iter().take(5) {
+                let content = std::fs::read_to_string(path).unwrap_or_default();
+                let title = content.lines()
+                    .find(|l| l.starts_with("# "))
+                    .map(|l| l.trim_start_matches("# "))
+                    .unwrap_or_else(|| path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"));
+                eprintln!("  • {title}");
+            }
+            if total > 5 { eprintln!("  … and {} more", total - 5); }
+            eprintln!();
+        }
+    }
+
+    let connected = Arc::new(AtomicBool::new(false));
+
     write_pid(&root)?;
     let root_for_cleanup = root.clone();
     // remove PID file on exit via a drop guard
@@ -288,18 +439,19 @@ pub async fn run() -> anyhow::Result<()> {
     impl Drop for PidGuard { fn drop(&mut self) { remove_pid(&self.0); } }
     let _pid_guard = PidGuard(root_for_cleanup);
 
-    // background heartbeat
+    // background heartbeat + connection tracking
     let hb_base = base.clone();
     let hb_id = agent_id.clone();
     let hb_name = config.name.clone();
     let hb_desc = config.description.clone();
     let hb_root = root_str.clone();
+    let hb_connected = connected.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        let mut ticker = interval(Duration::from_secs(15));
+        let mut ticker = interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
-            let _ = client
+            let ok = client
                 .get(format!("{hb_base}/heartbeat"))
                 .query(&[
                     ("agent_id", hb_id.as_str()),
@@ -308,13 +460,17 @@ pub async fn run() -> anyhow::Result<()> {
                     ("repo_path", hb_root.as_str()),
                 ])
                 .send()
-                .await;
+                .await
+                .and_then(|r| r.error_for_status())
+                .is_ok();
+            let was = hb_connected.swap(ok, Ordering::Relaxed);
+            if ok && !was  { eprintln!("↑ connected to {hb_base}"); }
+            if !ok && was  { eprintln!("↓ server unreachable, working offline"); }
         }
     });
 
     // background task loop
     let task_base = base.clone();
-    let task_id = agent_id.clone();
     let task_flags = claude_flags.clone();
     let task_root = root_str.clone();
     tokio::spawn(async move {
@@ -326,40 +482,73 @@ pub async fn run() -> anyhow::Result<()> {
         let _ = std::fs::create_dir_all(&todo_dir);
         let _ = std::fs::create_dir_all(&done_dir);
         let _ = std::fs::create_dir_all(&blocked_dir);
+        let mut priority_queue: Vec<String> = Vec::new();
         loop {
             ticker.tick().await;
-            // claim next queued task
-            let resp = client
-                .get(format!("{task_base}/task/claim"))
-                .query(&[("agent_id", &task_id)])
-                .send()
-                .await;
-            let task: serde_json::Value = match resp {
-                Ok(r) if r.status().is_success() => match r.json().await {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                },
-                _ => continue,
+
+            // refill priority queue when exhausted
+            if priority_queue.is_empty() {
+                let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(&todo_dir) {
+                    for entry in rd.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+                        let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH.into());
+                        entries.push((path, mtime));
+                    }
+                }
+                entries.sort_by_key(|(_, t)| *t);
+                if entries.is_empty() { continue; }
+
+                if entries.len() == 1 {
+                    let id = entries[0].0.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    priority_queue = vec![id];
+                } else {
+                    // triage: ask Claude to order and categorize all pending tasks
+                    let summaries: Vec<(String, String, String)> = entries.iter().map(|(p, _)| {
+                        let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+                        let content = std::fs::read_to_string(p).unwrap_or_default();
+                        let title = content.lines()
+                            .find(|l| l.starts_with("# "))
+                            .map(|l| l.trim_start_matches("# ").to_string())
+                            .unwrap_or_else(|| id.clone());
+                        let preview: String = content.chars().take(300).collect();
+                        (id, title, preview)
+                    }).collect();
+                    eprintln!("📋 triaging {} pending tasks…", summaries.len());
+                    priority_queue = triage_tasks(&summaries, &done_dir, &blocked_dir, &task_flags, &task_root).await;
+                    if priority_queue.is_empty() { continue; }
+                }
+            }
+
+            // pop the next valid task from the queue
+            let tid = loop {
+                if priority_queue.is_empty() { break None; }
+                let candidate = priority_queue.remove(0);
+                if todo_dir.join(format!("{candidate}.md")).exists() {
+                    break Some(candidate);
+                }
             };
-            let tid = match task["id"].as_str() {
-                Some(s) => s.to_string(),
+            let tid = match tid {
+                Some(t) => t,
                 None => continue,
             };
-            let body = task["body"].as_str().unwrap_or("").to_string();
-            let title = task["title"].as_str().unwrap_or("").to_string();
+
+            let todo_file = todo_dir.join(format!("{tid}.md"));
+            let content = std::fs::read_to_string(&todo_file).unwrap_or_default();
+            let title = content.lines()
+                .find(|l| l.starts_with("# "))
+                .map(|l| l.trim_start_matches("# ").to_string())
+                .unwrap_or_else(|| tid.clone());
             eprintln!("⚙ task [{tid}] {title}");
 
-            // write task file to .task/todo/<id>.md
-            let todo_file = todo_dir.join(format!("{tid}.md"));
-            let task_content = format!("# {title}\n\n{body}\n");
-            let _ = std::fs::write(&todo_file, &task_content);
-
-            // run claude with the task body as the prompt
-            let reply = route_to_claude(&body, &task_flags, &task_root).await;
+            // run claude with the full task file as the prompt
+            eprintln!("  claude working on [{tid}]…");
+            let reply = route_to_claude(&content, &task_flags, &task_root).await;
 
             // detect BLOCKED: <reason> as the first line of output
             let (status, dest_dir, section_heading) =
-                if let Some(reason) = reply.strip_prefix("BLOCKED:") {
+                if let Some(_reason) = reply.strip_prefix("BLOCKED:") {
                     ("blocked", &blocked_dir, "Blocked")
                 } else if reply.starts_with("[claude exited") || reply.starts_with("[failed") {
                     ("failed", &done_dir, "Result")
@@ -399,7 +588,29 @@ pub async fn run() -> anyhow::Result<()> {
         }
     });
 
-    // message poll loop — exits cleanly on SIGINT or SIGTERM
+    // background task-sync loop — only when connected; hashes .task/ every 5 s, pushes on change
+    let sync_base = base.clone();
+    let sync_id = agent_id.clone();
+    let sync_root = root_str.clone();
+    let sync_connected = connected.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let mut ticker = interval(Duration::from_secs(5));
+        let mut last_hash: u64 = 0;
+        loop {
+            ticker.tick().await;
+            if !sync_connected.load(Ordering::Relaxed) { continue; }
+            let hash = task_dir_hash(&sync_root);
+            if hash == last_hash { continue; }
+            let tasks = read_task_snapshot(&sync_root);
+            let payload = TaskSyncPayload { agent_id: sync_id.clone(), hash, tasks };
+            if let Ok(r) = client.post(format!("{sync_base}/task/sync")).json(&payload).send().await {
+                if r.status().is_success() { last_hash = hash; }
+            }
+        }
+    });
+
+    // message poll loop — exits cleanly on SIGINT or SIGTERM; skips when offline
     let client = reqwest::Client::new();
     let mut poll = interval(Duration::from_secs(5));
     loop {
@@ -411,6 +622,8 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
 
+        if !connected.load(Ordering::Relaxed) { continue; }
+
         let inbox: InboxResponse = match client
             .get(format!("{base}/message/recv"))
             .query(&[("agent_id", &agent_id)])
@@ -420,15 +633,9 @@ pub async fn run() -> anyhow::Result<()> {
         {
             Ok(r) => match r.json().await {
                 Ok(v) => v,
-                Err(e) => {
-                    eprintln!("parse error: {e}");
-                    continue;
-                }
+                Err(_) => continue,
             },
-            Err(e) => {
-                eprintln!("recv error: {e}");
-                continue;
-            }
+            Err(_) => continue, // heartbeat loop reports the disconnection
         };
 
         for msg in inbox.messages {
@@ -443,6 +650,80 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Ask Claude to triage a list of pending tasks.
+/// Moves SKIP tasks to done/ and BLOCK tasks to blocked/ via `git mv`.
+/// Returns an ordered list of task IDs to work on (WORK decisions, highest priority first).
+async fn triage_tasks(
+    tasks: &[(String, String, String)], // (id, title, preview)
+    done_dir: &std::path::Path,
+    blocked_dir: &std::path::Path,
+    flags: &str,
+    cwd: &str,
+) -> Vec<String> {
+    let mut prompt = String::from(
+        "You are triaging a software task queue. Review each pending task and assign it one of three fates.\n\n\
+         Tasks:\n"
+    );
+    for (id, title, preview) in tasks {
+        prompt.push_str(&format!("\n[{id}] {title}\n{preview}\n"));
+    }
+    prompt.push_str(
+        "\nRespond with EXACTLY one line per task (include every task ID):\n\
+         WORK: <id>           — keep, will be worked on (list in priority order, highest first)\n\
+         SKIP: <id> | <reason>  — obsolete, already done, or superseded\n\
+         BLOCK: <id> | <question>  — needs human input before it can proceed\n\
+         \nDo not include any other text."
+    );
+
+    let reply = route_to_claude(&prompt, flags, cwd).await;
+    let todo_dir = std::path::Path::new(cwd).join(".task/todo");
+    let mut work_ids: Vec<String> = Vec::new();
+
+    for line in reply.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("WORK:") {
+            let id = rest.trim().to_string();
+            if !id.is_empty() { work_ids.push(id); }
+        } else if let Some(rest) = line.strip_prefix("SKIP:") {
+            let id = rest.split('|').next().unwrap_or("").trim().to_string();
+            let reason = rest.split_once('|').map(|(_, r)| r.trim()).unwrap_or("obsolete or superseded");
+            if id.is_empty() { continue; }
+            let src = todo_dir.join(format!("{id}.md"));
+            let dest = done_dir.join(format!("{id}.md"));
+            if src.exists() {
+                let _ = std::process::Command::new("git")
+                    .args(["mv", &src.to_string_lossy(), &dest.to_string_lossy()])
+                    .current_dir(cwd)
+                    .output();
+                if let Ok(mut c) = std::fs::read_to_string(&dest) {
+                    c.push_str(&format!("\n## Result\n\nSkipped: {reason}\n"));
+                    let _ = std::fs::write(&dest, c);
+                }
+                eprintln!("⊘ skipped [{id}]: {reason}");
+            }
+        } else if let Some(rest) = line.strip_prefix("BLOCK:") {
+            let id = rest.split('|').next().unwrap_or("").trim().to_string();
+            let question = rest.split_once('|').map(|(_, r)| r.trim()).unwrap_or("needs human input");
+            if id.is_empty() { continue; }
+            let src = todo_dir.join(format!("{id}.md"));
+            let dest = blocked_dir.join(format!("{id}.md"));
+            if src.exists() {
+                let _ = std::process::Command::new("git")
+                    .args(["mv", &src.to_string_lossy(), &dest.to_string_lossy()])
+                    .current_dir(cwd)
+                    .output();
+                if let Ok(mut c) = std::fs::read_to_string(&dest) {
+                    c.push_str(&format!("\n## Blocked\n\n{question}\n"));
+                    let _ = std::fs::write(&dest, c);
+                }
+                eprintln!("⚡ blocked [{id}]: {question}");
+            }
+        }
+    }
+
+    work_ids
 }
 
 async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {

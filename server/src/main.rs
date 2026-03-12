@@ -24,6 +24,8 @@ struct AgentRecord {
     description: String,
     last_heartbeat: DateTime<Utc>,
     repo_path: Option<String>,
+    task_snapshot: Vec<TaskItem>,
+    task_snapshot_hash: u64,
 }
 
 struct Message {
@@ -159,6 +161,21 @@ struct TaskListResponse {
     tasks: Vec<TaskItem>,
 }
 
+#[derive(Object)]
+struct TaskSyncItem {
+    id: String,
+    title: String,
+    status: String,
+    modified_at: String,
+}
+
+#[derive(Object)]
+struct TaskSyncRequest {
+    agent_id: String,
+    hash: u64,
+    tasks: Vec<TaskSyncItem>,
+}
+
 #[derive(ApiResponse)]
 enum TaskOrNotFound {
     /// Task found
@@ -213,6 +230,8 @@ impl PunchclockApi {
             description: description.0,
             last_heartbeat: Utc::now(),
             repo_path: repo_path.0,
+            task_snapshot: Vec::new(),
+            task_snapshot_hash: 0,
         };
         state.agents.write().await.insert(id.clone(), record);
         state.inboxes.write().await.insert(id.clone(), VecDeque::new());
@@ -252,6 +271,8 @@ impl PunchclockApi {
                 description: desc,
                 last_heartbeat: Utc::now(),
                 repo_path: repo_path.0,
+                task_snapshot: Vec::new(),
+                task_snapshot_hash: 0,
             };
             agents.insert(agent_id.0.clone(), record);
             drop(agents);
@@ -369,20 +390,18 @@ impl PunchclockApi {
         agent_id: Query<String>,
     ) -> Result<Json<InboxResponse>, poem::Error> {
         let mut inboxes = state.inboxes.write().await;
-        match inboxes.get_mut(&agent_id.0) {
-            Some(inbox) => {
-                let messages = inbox
-                    .drain(..)
-                    .map(|m| MessageItem {
-                        from: m.from,
-                        body: m.body,
-                        timestamp: m.timestamp.to_rfc3339(),
-                    })
-                    .collect();
-                Ok(Json(InboxResponse { messages }))
-            }
-            None => Err(poem::Error::from_status(poem::http::StatusCode::NOT_FOUND)),
-        }
+        let messages = match inboxes.get_mut(&agent_id.0) {
+            Some(inbox) => inbox
+                .drain(..)
+                .map(|m| MessageItem {
+                    from: m.from,
+                    body: m.body,
+                    timestamp: m.timestamp.to_rfc3339(),
+                })
+                .collect(),
+            None => vec![],
+        };
+        Ok(Json(InboxResponse { messages }))
     }
 
     /// Push a task onto an agent's queue.
@@ -421,10 +440,47 @@ impl PunchclockApi {
         TaskOrNotFound::Ok(Json(item))
     }
 
-    /// List all tasks for an agent, read from the agent's .task/ directory.
+    /// Sync task list from daemon (replaces filesystem read for remote servers).
     ///
-    /// Returns files from `.task/todo/` as `queued` and `.task/done/` as `done`.
-    /// Falls back to the in-memory task list if the agent has no repo_path set.
+    /// The daemon calls this every 5 s whenever the hash of its `.task/` directory
+    /// changes. The server stores the snapshot and returns it from `task/list`.
+    #[oai(path = "/task/sync", method = "post")]
+    async fn task_sync(
+        &self,
+        state: poem::web::Data<&SharedState>,
+        body: Json<TaskSyncRequest>,
+    ) -> OkOrNotFound {
+        let mut agents = state.agents.write().await;
+        match agents.get_mut(&body.agent_id) {
+            Some(agent) => {
+                if agent.task_snapshot_hash == body.hash {
+                    return OkOrNotFound::Ok;
+                }
+                agent.task_snapshot_hash = body.hash;
+                agent.task_snapshot = body.tasks.iter().map(|t| TaskItem {
+                    id: t.id.clone(),
+                    agent_id: body.agent_id.clone(),
+                    title: t.title.clone(),
+                    body: String::new(),
+                    status: t.status.clone(),
+                    created_at: t.modified_at.clone(),
+                    started_at: None,
+                    finished_at: None,
+                    result: None,
+                }).collect();
+                OkOrNotFound::Ok
+            }
+            None => OkOrNotFound::NotFound(Json(ErrorBody {
+                error: format!("agent {} not found", body.agent_id),
+            })),
+        }
+    }
+
+    /// List all tasks for an agent.
+    ///
+    /// Prefers the daemon-pushed snapshot (works for remote servers).
+    /// Falls back to reading the agent's `.task/` directory from disk, then
+    /// to the in-memory task list.
     #[oai(path = "/task/list", method = "get")]
     async fn task_list(
         &self,
@@ -432,12 +488,20 @@ impl PunchclockApi {
         /// Agent ID to query
         agent_id: Query<String>,
     ) -> Json<TaskListResponse> {
-        let repo_path = state
-            .agents
-            .read()
-            .await
-            .get(&agent_id.0)
-            .and_then(|a| a.repo_path.clone());
+        let (repo_path, snapshot) = {
+            let agents = state.agents.read().await;
+            let agent = agents.get(&agent_id.0);
+            (
+                agent.and_then(|a| a.repo_path.clone()),
+                agent.map(|a| a.task_snapshot.clone()).unwrap_or_default(),
+            )
+        };
+
+        if !snapshot.is_empty() {
+            let mut items = snapshot;
+            items.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            return Json(TaskListResponse { tasks: items });
+        }
 
         if let Some(root) = repo_path {
             let mut items = Vec::new();
