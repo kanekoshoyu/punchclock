@@ -2,6 +2,7 @@ use anyhow::{bail, Context};
 use dialoguer::{theme::ColorfulTheme, Input};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::{Path, PathBuf}, process::Stdio, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{interval, Duration};
 
@@ -103,7 +104,7 @@ questions:
     default: "http://localhost:8421"
   - key: claude_flags
     label: "Extra claude flags (e.g. --allowedTools Edit,Write,Bash)"
-    default: ""
+    default: "--allowedTools Edit,Write,Bash,Read"
 "#;
 
 fn load_template() -> anyhow::Result<Template> {
@@ -544,14 +545,20 @@ pub async fn run() -> anyhow::Result<()> {
 
             // run claude with the full task file as the prompt
             eprintln!("  claude working on [{tid}]…");
-            let reply = route_to_claude(&content, &task_flags, &task_root).await;
+            let prompt = format!(
+                "IMPORTANT: If you cannot complete this task for any reason — missing permissions, \
+                 need clarification, blocked by something outside your control — respond with \
+                 BLOCKED: <reason> as the very first line of your response. Do not ask questions; \
+                 just state what is needed.\n\n{content}"
+            );
+            let reply = route_to_claude(&prompt, &task_flags, &task_root).await;
 
             // detect BLOCKED: <reason> as the first line of output
             let (status, dest_dir, section_heading) =
                 if let Some(_reason) = reply.strip_prefix("BLOCKED:") {
                     ("blocked", &blocked_dir, "Blocked")
                 } else if reply.starts_with("[claude exited") || reply.starts_with("[failed") {
-                    ("failed", &done_dir, "Result")
+                    ("blocked", &blocked_dir, "Error")
                 } else {
                     ("done", &done_dir, "Result")
                 };
@@ -729,6 +736,8 @@ async fn triage_tasks(
 async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
     let mut cmd = Command::new("claude");
     cmd.arg("-p").arg(body);
+    cmd.arg("--dangerouslySkipPermissions");
+    cmd.arg("--output-format").arg("stream-json");
     cmd.current_dir(cwd);
     cmd.env_remove("CLAUDECODE");
     cmd.stdout(Stdio::piped());
@@ -736,16 +745,129 @@ async fn route_to_claude(body: &str, flags: &str, cwd: &str) -> String {
     for flag in flags.split_whitespace().filter(|s| !s.is_empty()) {
         cmd.arg(flag);
     }
-    match cmd.output().await {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("[failed to spawn claude: {e}]"),
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return "[failed to capture stdout]".to_string(),
+    };
+
+    // spinner state
+    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut frame = 0usize;
+    let mut files_written: Vec<String> = Vec::new();
+    let mut files_read: Vec<String> = Vec::new();
+    let mut bash_runs: u32 = 0;
+    let mut result_text = String::new();
+
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        // advance spinner on each line
+        eprint!("\r{} Orchestrating…", FRAMES[frame % FRAMES.len()]);
+        frame += 1;
+
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                let content = v
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array());
+                if let Some(blocks) = content {
+                    for block in blocks {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let input = block.get("input");
+                            match name {
+                                "Edit" | "Write" | "NotebookEdit" => {
+                                    if let Some(path) = input
+                                        .and_then(|i| i.get("file_path"))
+                                        .and_then(|p| p.as_str())
+                                    {
+                                        files_written.push(path.to_string());
+                                        eprint!("\r{} Editing {}…        ", FRAMES[frame % FRAMES.len()], path);
+                                    }
+                                }
+                                "Read" => {
+                                    if let Some(path) = input
+                                        .and_then(|i| i.get("file_path"))
+                                        .and_then(|p| p.as_str())
+                                    {
+                                        files_read.push(path.to_string());
+                                    }
+                                }
+                                "Bash" => {
+                                    bash_runs += 1;
+                                    let cmd_str = input
+                                        .and_then(|i| i.get("command"))
+                                        .and_then(|c| c.as_str())
+                                        .unwrap_or("…");
+                                    let preview: String = cmd_str.chars().take(40).collect();
+                                    eprint!("\r{} Running {}…        ", FRAMES[frame % FRAMES.len()], preview);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                result_text = v
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if v.get("subtype").and_then(|s| s.as_str()) == Some("error_during_execution") {
+                    let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+                    // clear spinner line
+                    eprint!("\r{:width$}\r", "", width = 60);
+                    return format!("[claude exited with error] {err}");
+                }
+            }
+            _ => {}
         }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            format!("[claude exited {}] {err}", out.status)
-        }
-        Err(e) => format!("[failed to spawn claude: {e}]"),
     }
+
+    // clear spinner line
+    eprint!("\r{:width$}\r", "", width = 60);
+
+    // wait for process
+    let status = child.wait().await;
+    if let Ok(s) = status {
+        if !s.success() && result_text.is_empty() {
+            return format!("[claude exited {}]", s);
+        }
+    }
+
+    // emit coarse summary
+    let mut parts = Vec::new();
+    if !files_written.is_empty() {
+        let unique: std::collections::HashSet<_> = files_written.iter().collect();
+        parts.push(format!("edited {} file(s)", unique.len()));
+    }
+    if !files_read.is_empty() {
+        let unique: std::collections::HashSet<_> = files_read.iter().collect();
+        parts.push(format!("read {} file(s)", unique.len()));
+    }
+    if bash_runs > 0 {
+        parts.push(format!("ran {} command(s)", bash_runs));
+    }
+    if !parts.is_empty() {
+        eprintln!("  ↳ {}", parts.join(", "));
+    }
+
+    result_text
 }
 
 // ── start / stop ──────────────────────────────────────────────────────────────

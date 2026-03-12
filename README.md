@@ -2,11 +2,15 @@
 
 A lightweight presence + messaging + task-routing bus for Claude agents.
 
-Run a server, register your git repos as agents, drop tasks into `.task/todo/`, and Claude does the work.
+Run `punchclock agent run` in any git repo and it continuously checks `.task/todo/` for work. Drop a markdown file in — the daemon picks it up, runs it through `claude -p`, and moves it to `.task/done/`. No server needed to get started; if a server is online the daemon also syncs task state into it so your whole team can see what each agent is working on.
 
 ```
 You  ──task file──▶  .task/todo/   ──claimed by──▶  punchclock daemon  ──▶  claude -p  ──▶  .task/done/
-                                                      (heartbeat + poll)
+                                                      (polls every 5 s)
+                                                           │
+                                                      (if server online)
+                                                           ▼
+                                                    syncs into server  ──▶  punchclock task list / team
 ```
 
 ---
@@ -53,10 +57,11 @@ Asks for name, description, server URL, and optional extra `claude` flags. Regis
 punchclock agent run
 ```
 
-The daemon:
-- sends a heartbeat every 15 s (re-registers automatically if the server restarted)
-- polls for messages every 5 s and routes them to `claude -p`
-- polls for `.task/todo/*.md` files every 5 s, claims one at a time, runs it through `claude -p`, and `git mv`s it to `.task/done/` with the result appended
+The daemon runs three loops concurrently:
+
+- **Task loop (every 5 s)** — checks `.task/todo/*.md` in this repo, claims one task at a time, runs it through `claude -p`, and `git mv`s it to `.task/done/` with the result appended. This works entirely offline — no server required.
+- **Heartbeat loop (every 15 s)** — if a server is configured, registers this agent and keeps it alive. Re-registers automatically if the server restarts. This is what makes the agent visible on `punchclock team` and syncs task state so others can run `punchclock task list`.
+- **Message loop (every 5 s)** — drains the server inbox and routes each message to `claude -p`, then replies to the sender.
 
 ### 4. Push a task
 
@@ -91,7 +96,7 @@ punchclock task list <agent-id>         # queued + done tasks (reads from .task/
 1. A markdown file appears in `.task/todo/<id>.md` **inside the agent's repo** (e.g. `~/myrepo/.task/todo/`).
 2. The daemon (running inside that repo) claims it and runs `claude -p "<body>"` in the repo directory.
 3. On completion the file is `git mv`d to `.task/done/<id>.md` and the result is appended under `## Result`.
-4. If Claude outputs `BLOCKED: <reason>` as its first line, the file goes to `.task/blocked/` instead, with the reason appended under `## Blocked`.
+4. If Claude outputs `BLOCKED: <reason>` as its first line, or Claude itself exits with an error, the file goes to `.task/blocked/` with the reason/error appended — both cases need human attention before work can resume.
 5. `GET /task/list` reads all three directories **directly from the agent's repo on disk** using the `repo_path` the agent registered with. The punchclock server holds no task state of its own — it is just reading the remote filesystem path at request time.
 
 ---
