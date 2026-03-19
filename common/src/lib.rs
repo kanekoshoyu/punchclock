@@ -24,9 +24,11 @@ pub struct TeamResponse {
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "poem-openapi", derive(poem_openapi::Object))]
 pub struct MessageItem {
+    pub id: String,
     pub from: String,
     pub body: String,
     pub timestamp: String,
+    pub acked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,6 +78,19 @@ pub struct TaskSyncRequest {
     pub agent_id: String,
     pub hash: u64,
     pub tasks: Vec<TaskSyncItem>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem-openapi", derive(poem_openapi::Object))]
+pub struct MessageStatusResponse {
+    pub id: String,
+    pub acked: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "poem-openapi", derive(poem_openapi::Object))]
+pub struct MessageStatusListResponse {
+    pub messages: Vec<MessageStatusResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

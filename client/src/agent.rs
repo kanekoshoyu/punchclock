@@ -1088,3 +1088,70 @@ pub async fn logs() -> anyhow::Result<()> {
     child.wait()?;
     Ok(())
 }
+
+// ── up (multi-repo daemon) ─────────────────────────────────────────────────────
+
+pub async fn up(foreground: bool) -> anyhow::Result<()> {
+    let repos = crate::config::load_repos()?;
+    let enabled_repos: Vec<_> = repos.iter()
+        .filter(|(_, entry)| entry.enabled)
+        .collect();
+
+    if enabled_repos.is_empty() {
+        eprintln!("no repos registered — use \"punchclock add <path>\" to add one");
+        return Ok(());
+    }
+
+    if !foreground {
+        return up_background().await;
+    }
+
+    // Foreground: spawn all agent loops and run main loop
+    up_foreground(enabled_repos).await
+}
+
+async fn up_foreground(repos: Vec<(&String, &crate::config::RepoEntry)>) -> anyhow::Result<()> {
+    let base_pid_path = crate::config::config_dir().join("daemon.pid");
+    std::fs::create_dir_all(base_pid_path.parent().unwrap())?;
+    std::fs::write(&base_pid_path, std::process::id().to_string())?;
+
+    let pid_for_cleanup = base_pid_path.clone();
+    struct PidGuard(PathBuf);
+    impl Drop for PidGuard { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+    let _pid_guard = PidGuard(pid_for_cleanup);
+
+    println!("punchclock up: managing {} repo(s)", repos.len());
+    for (name, _entry) in &repos {
+        println!("  • {}", name);
+    }
+
+    // For now, just start one event loop that handles SIGINT
+    // In a real implementation, each repo would have its own task set
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nshutting down…");
+        }
+    }
+    Ok(())
+}
+
+async fn up_background() -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("cannot determine current executable path")?;
+    let base_log_path = crate::config::config_dir().join("daemon.log");
+    std::fs::create_dir_all(base_log_path.parent().unwrap())?;
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&base_log_path)?;
+
+    std::process::Command::new(&exe)
+        .args(["up"])
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        .spawn()
+        .context("failed to spawn daemon")?;
+
+    println!("daemon spawned  log → {}", base_log_path.display());
+    Ok(())
+}

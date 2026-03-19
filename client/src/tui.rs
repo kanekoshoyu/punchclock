@@ -17,6 +17,16 @@ use ratatui::{
     Terminal,
 };
 
+// TODO: Multi-agent TUI support
+// To fully support multiple agents:
+// 1. Load repos.toml on TUI start via crate::config::load_repos()
+// 2. Maintain state for multiple agents (HashMap<String, AgentState>)
+// 3. Add key bindings to switch between agents (e.g., arrow keys, numbered selection)
+// 4. Render a left sidebar showing all registered agents + online status
+// 5. Query /team periodically to determine which agents are online
+// 6. Allow filtering the log and task view by selected agent
+// For now, this TUI continues to display single-agent mode
+
 const MAX_LOG: usize = 200;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK_MS: u64 = 80;

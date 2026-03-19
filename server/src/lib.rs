@@ -6,8 +6,8 @@ use poem::{
 };
 use poem_openapi::{param::Query, payload::{Html, Json}, ApiResponse, OpenApi, OpenApiService};
 use punchclock_common::{
-    AgentSummary, BroadcastResponse, ErrorBody, InboxResponse, MessageItem, RegisterResponse,
-    TaskItem, TaskListResponse, TaskSyncRequest, TeamResponse,
+    AgentSummary, BroadcastResponse, ErrorBody, InboxResponse, MessageItem, MessageStatusListResponse,
+    MessageStatusResponse, RegisterResponse, TaskItem, TaskListResponse, TaskSyncRequest, TeamResponse,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -47,9 +47,11 @@ pub struct AgentRecord {
 }
 
 struct Message {
+    id: String,
     from: String,
     body: String,
     timestamp: DateTime<Utc>,
+    acked: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -90,6 +92,7 @@ pub struct AppState {
     pub(crate) agents: RwLock<HashMap<String, AgentRecord>>,
     pub(crate) inboxes: RwLock<HashMap<String, VecDeque<Message>>>,
     tasks: RwLock<HashMap<String, TaskRecord>>,
+    message_acks: RwLock<HashMap<String, HashMap<String, bool>>>,
 }
 
 impl AppState {
@@ -99,6 +102,7 @@ impl AppState {
             agents: Default::default(),
             inboxes: Default::default(),
             tasks: Default::default(),
+            message_acks: Default::default(),
         }
     }
 }
@@ -356,17 +360,27 @@ impl PunchclockApi {
         body: Query<String>,
     ) -> OkOrNotFound {
         let max = state.config.max_inbox;
+        let msg_id = Uuid::new_v4().to_string();
         let mut inboxes = state.inboxes.write().await;
         match inboxes.get_mut(&to.0) {
             Some(inbox) => {
                 if inbox.len() >= max {
-                    inbox.pop_front();
+                    if let Some(old_msg) = inbox.pop_front() {
+                        let mut acks = state.message_acks.write().await;
+                        if let Some(agent_acks) = acks.get_mut(&to.0) {
+                            agent_acks.remove(&old_msg.id);
+                        }
+                    }
                 }
                 inbox.push_back(Message {
+                    id: msg_id.clone(),
                     from: from.0,
                     body: body.0,
                     timestamp: Utc::now(),
+                    acked: false,
                 });
+                let mut acks = state.message_acks.write().await;
+                acks.entry(to.0.clone()).or_default().insert(msg_id, false);
                 OkOrNotFound::Ok
             }
             None => OkOrNotFound::NotFound(Json(ErrorBody {
@@ -396,17 +410,26 @@ impl PunchclockApi {
             .collect();
 
         let mut inboxes = state.inboxes.write().await;
+        let mut acks = state.message_acks.write().await;
         let mut delivered = 0usize;
         for id in &live_ids {
             if let Some(inbox) = inboxes.get_mut(id) {
                 if inbox.len() >= max {
-                    inbox.pop_front();
+                    if let Some(old_msg) = inbox.pop_front() {
+                        if let Some(agent_acks) = acks.get_mut(id) {
+                            agent_acks.remove(&old_msg.id);
+                        }
+                    }
                 }
+                let msg_id = Uuid::new_v4().to_string();
                 inbox.push_back(Message {
+                    id: msg_id.clone(),
                     from: from.0.clone(),
                     body: body.0.clone(),
                     timestamp: Utc::now(),
+                    acked: false,
                 });
+                acks.entry(id.clone()).or_default().insert(msg_id, false);
                 delivered += 1;
             }
         }
@@ -421,18 +444,74 @@ impl PunchclockApi {
         agent_id: Query<String>,
     ) -> Result<Json<InboxResponse>, poem::Error> {
         let mut inboxes = state.inboxes.write().await;
+        let acks = state.message_acks.read().await;
+        let agent_acks = acks.get(&agent_id.0).cloned().unwrap_or_default();
         let messages = match inboxes.get_mut(&agent_id.0) {
             Some(inbox) => inbox
                 .drain(..)
-                .map(|m| MessageItem {
-                    from: m.from,
-                    body: m.body,
-                    timestamp: m.timestamp.to_rfc3339(),
+                .map(|m| {
+                    let acked = agent_acks.get(&m.id).copied().unwrap_or(false);
+                    MessageItem {
+                        id: m.id,
+                        from: m.from,
+                        body: m.body,
+                        timestamp: m.timestamp.to_rfc3339(),
+                        acked,
+                    }
                 })
                 .collect(),
             None => vec![],
         };
         Ok(Json(InboxResponse { messages }))
+    }
+
+    /// Acknowledge a message (mark as received).
+    #[oai(path = "/message/ack", method = "post")]
+    async fn ack_message(
+        &self,
+        state: poem::web::Data<&SharedState>,
+        agent_id: Query<String>,
+        message_id: Query<String>,
+    ) -> OkOrNotFound {
+        let mut acks = state.message_acks.write().await;
+        match acks.get_mut(&agent_id.0) {
+            Some(agent_acks) => {
+                if agent_acks.contains_key(&message_id.0) {
+                    agent_acks.insert(message_id.0, true);
+                    OkOrNotFound::Ok
+                } else {
+                    OkOrNotFound::NotFound(Json(ErrorBody {
+                        error: format!("message {} not found", message_id.0),
+                    }))
+                }
+            }
+            None => OkOrNotFound::NotFound(Json(ErrorBody {
+                error: format!("agent {} not found", agent_id.0),
+            })),
+        }
+    }
+
+    /// Get ack status of all messages for an agent.
+    #[oai(path = "/message/status", method = "get")]
+    async fn message_status(
+        &self,
+        state: poem::web::Data<&SharedState>,
+        agent_id: Query<String>,
+    ) -> Result<Json<MessageStatusListResponse>, poem::Error> {
+        let acks = state.message_acks.read().await;
+        let messages = acks
+            .get(&agent_id.0)
+            .map(|agent_acks| {
+                agent_acks
+                    .iter()
+                    .map(|(id, acked)| MessageStatusResponse {
+                        id: id.clone(),
+                        acked: *acked,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Json(MessageStatusListResponse { messages }))
     }
 
     /// Push a task onto an agent's queue.
@@ -749,9 +828,11 @@ moves the file to <code>.task/done/</code> with the result appended.</p>
   <tr><td>GET /register</td><td>Create an agent. Returns <code>agent_id</code>.</td></tr>
   <tr><td>GET /heartbeat</td><td>Keep alive. Re-registers automatically if reaped (pass <code>name</code> + <code>description</code>).</td></tr>
   <tr><td>GET /team</td><td>List agents with a heartbeat in the last 30 s.</td></tr>
-  <tr><td>GET /message/send</td><td>Push a message to an agent's inbox.</td></tr>
-  <tr><td>GET /message/recv</td><td>Drain your inbox (destructive read).</td></tr>
+  <tr><td>GET /message/send</td><td>Push a message to an agent's inbox. Returns message with <code>id</code> and <code>acked</code> status.</td></tr>
+  <tr><td>GET /message/recv</td><td>Drain your inbox (destructive read). Messages include <code>id</code> and <code>acked</code> status.</td></tr>
   <tr><td>GET /message/broadcast</td><td>Send to all online agents at once.</td></tr>
+  <tr><td>POST /message/ack</td><td>Acknowledge a message as received. Pass <code>agent_id</code> and <code>message_id</code>.</td></tr>
+  <tr><td>GET /message/status</td><td>Get ack status of all messages for an agent. Pass <code>agent_id</code>.</td></tr>
   <tr><td>GET /task/list</td><td>Return the daemon-pushed task snapshot (or in-memory tasks created via <code>task/push</code>).</td></tr>
   <tr><td>GET /task/claim</td><td>Atomically grab the next queued task (sets it in-progress).</td></tr>
   <tr><td>GET /task/block</td><td>Mark a task blocked and record why. Daemon moves file to <code>.task/blocked/</code>.</td></tr>

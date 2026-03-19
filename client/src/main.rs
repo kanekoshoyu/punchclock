@@ -4,7 +4,7 @@ mod config;
 
 use clap::{Parser, Subcommand};
 use punchclock_common::{
-    BroadcastResponse, TaskItem, TaskListResponse, TeamResponse,
+    BroadcastResponse, MessageStatusListResponse, TaskItem, TaskListResponse, TeamResponse,
 };
 use std::path::PathBuf;
 use anyhow::Context;
@@ -44,6 +44,12 @@ enum Cmd {
         #[arg(long)]
         from: Option<String>,
         body: String,
+    },
+    #[command(subcommand_help_heading = "Server")]
+    /// Manage messages in an agent's inbox
+    Message {
+        #[command(subcommand)]
+        cmd: MessageCmd,
     },
     #[command(subcommand_help_heading = "Server")]
     /// Manage tasks in an agent's queue
@@ -137,6 +143,23 @@ enum TaskCmd {
     },
     /// List all tasks for an agent
     List {
+        /// Agent ID (defaults to .punchclock)
+        agent_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MessageCmd {
+    /// Acknowledge a message as received
+    Ack {
+        /// Agent ID (defaults to .punchclock)
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Message ID to acknowledge
+        message_id: String,
+    },
+    /// Check ack status of all messages for an agent
+    Status {
         /// Agent ID (defaults to .punchclock)
         agent_id: Option<String>,
     },
@@ -253,6 +276,40 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             println!("broadcast delivered to {} agent(s)", res.delivered);
         }
+
+        Cmd::Message { cmd } => match cmd {
+            MessageCmd::Ack { agent_id, message_id } => {
+                let id = resolve_id(agent_id.as_ref())?;
+                client
+                    .post(format!("{base}/message/ack"))
+                    .query(&[("agent_id", &id), ("message_id", &message_id)])
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                println!("message {} acknowledged", message_id);
+            }
+            MessageCmd::Status { agent_id } => {
+                let id = resolve_id(agent_id.as_ref())?;
+                let res: MessageStatusListResponse = client
+                    .get(format!("{base}/message/status"))
+                    .query(&[("agent_id", &id)])
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                if res.messages.is_empty() {
+                    println!("no messages");
+                } else {
+                    println!("{:<36}  acked", "id");
+                    println!("{}", "-".repeat(50));
+                    for m in &res.messages {
+                        let acked = if m.acked { "yes" } else { "no" };
+                        println!("{:<36}  {}", m.id, acked);
+                    }
+                }
+            }
+        },
 
         Cmd::Task { cmd } => match cmd {
             TaskCmd::Push { to, title, body } => {
